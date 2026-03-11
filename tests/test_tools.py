@@ -82,6 +82,28 @@ class TestBashTool:
         assert "timed out" in result.lower()
 
     @pytest.mark.asyncio
+    async def test_timeout_kills_children(self):
+        """Child processes spawned by bash must not outlive a timeout."""
+        import time
+        # Spawn a child that writes its PID to a temp file, then sleeps forever
+        cmd = (
+            "python3 -c \""
+            "import os, time, sys; "
+            "sys.stdout.write(str(os.getpid())); sys.stdout.flush(); "
+            "time.sleep(300)"
+            "\""
+        )
+        result = await call_native_tool("bash", {"command": cmd, "timeout": 2})
+        assert "timed out" in result.lower()
+        # Give the OS a moment to reap
+        time.sleep(0.5)
+        # The child python3 process should be gone
+        import psutil
+        for proc in psutil.process_iter(["cmdline"]):
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+            assert "time.sleep(300)" not in cmdline, "Child process survived timeout"
+
+    @pytest.mark.asyncio
     async def test_cwd(self, tmp_path):
         result = await call_native_tool("bash", {"command": "pwd", "cwd": str(tmp_path)})
         assert str(tmp_path) in result

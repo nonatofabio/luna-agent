@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -428,6 +429,40 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + f"\n... (truncated, {len(text)} total chars)"
 
 
+def _run_in_pgroup(command: str, cwd: str | None, timeout: int) -> tuple:
+    """Run a shell command in its own process group.
+
+    On timeout, sends SIGTERM then SIGKILL to the entire process group
+    so child processes (e.g. long-running scripts) don't become orphaned.
+    """
+    proc = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        cwd=cwd,
+        text=True,
+        start_new_session=True,  # new process group
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return proc, stdout, stderr, proc.returncode
+    except subprocess.TimeoutExpired:
+        # Kill the entire process group
+        pgid = os.getpgid(proc.pid)
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(pgid, signal.SIGKILL)
+                proc.wait(timeout=5)
+        except ProcessLookupError:
+            pass  # already dead
+        raise
+
+
 async def _tool_bash(args: dict, **kwargs) -> str:
     command = args.get("command", "")
     if not command:
@@ -441,17 +476,8 @@ async def _tool_bash(args: dict, **kwargs) -> str:
     cwd = args.get("cwd") or (_workspace and str(_workspace))
 
     try:
-        proc = await asyncio.wait_for(
-            asyncio.to_thread(
-                subprocess.run,
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                stdin=subprocess.DEVNULL,
-                cwd=cwd,
-                timeout=timeout,
-            ),
+        proc, stdout, stderr, returncode = await asyncio.wait_for(
+            asyncio.to_thread(_run_in_pgroup, command, cwd, timeout),
             timeout=timeout + 5,  # extra margin for thread overhead
         )
     except (asyncio.TimeoutError, subprocess.TimeoutExpired):
@@ -460,13 +486,13 @@ async def _tool_bash(args: dict, **kwargs) -> str:
         return f"Error: Working directory not found: {cwd}"
 
     output = ""
-    if proc.stdout:
-        output += proc.stdout
-    if proc.stderr:
-        output += ("\n--- stderr ---\n" if output else "") + proc.stderr
+    if stdout:
+        output += stdout
+    if stderr:
+        output += ("\n--- stderr ---\n" if output else "") + stderr
 
-    if proc.returncode != 0:
-        output += f"\n(exit code: {proc.returncode})"
+    if returncode != 0:
+        output += f"\n(exit code: {returncode})"
 
     return _truncate(output, BASH_MAX_OUTPUT) if output else "(no output)"
 
