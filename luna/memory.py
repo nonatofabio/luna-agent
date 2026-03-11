@@ -47,9 +47,19 @@ CREATE TABLE IF NOT EXISTS summaries (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS thread_intents (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL UNIQUE,
+    original_request TEXT NOT NULL,
+    interpreted_intent TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
+CREATE INDEX IF NOT EXISTS idx_thread_intents_session ON thread_intents(session_id);
 """
 
 FTS_SQL = """
@@ -299,6 +309,40 @@ class MemoryManager:
                   vec_hits=len(vec_results), returned=min(top_k, len(results)))
 
         return results[:top_k]
+
+    # --- Thread Intents ---
+
+    def get_thread_intent(self, session_id: str) -> dict[str, str] | None:
+        """Get the persisted intent for a session/thread."""
+        row = self.db.execute(
+            "SELECT original_request, interpreted_intent FROM thread_intents WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row:
+            return {"original_request": row[0], "interpreted_intent": row[1]}
+        return None
+
+    def save_thread_intent(self, session_id: str, original_request: str, interpreted_intent: str) -> None:
+        """Save or update the thread intent for a session."""
+        now = time.time()
+        self.db.execute(
+            "INSERT INTO thread_intents (session_id, original_request, interpreted_intent, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "original_request = excluded.original_request, "
+            "interpreted_intent = excluded.interpreted_intent, "
+            "updated_at = ?",
+            (session_id, original_request, interpreted_intent, now, now),
+        )
+        self.db.commit()
+        log_event(logger, "thread_intent_saved", session_id=session_id)
+
+    def has_thread_intent(self, session_id: str) -> bool:
+        """Check if a thread already has a persisted intent."""
+        row = self.db.execute(
+            "SELECT 1 FROM thread_intents WHERE session_id = ?", (session_id,),
+        ).fetchone()
+        return row is not None
 
     # --- Session Summaries ---
 

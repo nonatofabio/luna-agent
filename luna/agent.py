@@ -69,12 +69,19 @@ previously learned facts. Not all retrieved memories will be relevant — use ju
 
 {memory_section}
 {summary_section}
+{intent_section}
 
 Current time: {current_time}
 Workspace: {workspace}"""
 
 
-def _build_system_prompt(memories: list, summary: str | None, current_time: str, workspace: str = "") -> str:
+def _build_system_prompt(
+    memories: list,
+    summary: str | None,
+    current_time: str,
+    workspace: str = "",
+    thread_intent: dict[str, str] | None = None,
+) -> str:
     memory_section = ""
     if memories:
         mem_lines = []
@@ -86,9 +93,20 @@ def _build_system_prompt(memories: list, summary: str | None, current_time: str,
     if summary:
         summary_section = f"## Previous Context\n{summary}"
 
+    intent_section = ""
+    if thread_intent:
+        intent_section = (
+            "## Thread Objective\n"
+            f"**Original request:** {thread_intent['original_request']}\n"
+            f"**Intent:** {thread_intent['interpreted_intent']}\n"
+            "Keep this objective in mind throughout the conversation. All work in this thread "
+            "should advance this goal."
+        )
+
     return SYSTEM_PROMPT_TEMPLATE.format(
         memory_section=memory_section,
         summary_section=summary_section,
+        intent_section=intent_section,
         current_time=current_time,
         workspace=workspace,
     )
@@ -109,7 +127,7 @@ class Agent:
         self.llm = llm
         self.memory = memory
         self.mcp = mcp
-        self.max_tool_rounds = 25  # safety limit on tool call loops
+        self.max_tool_rounds = 30  # safety limit on tool call loops
         self.tool_callback = tool_callback
 
     async def process(
@@ -122,32 +140,58 @@ class Agent:
         with log_duration(logger, "agent_process", session_id=session_id):
             return await self._process_inner(message, session_id, status_callback)
 
+    async def _extract_intent(self, message: str, session_id: str) -> None:
+        """Use the LLM to interpret the user's intent and persist it for this thread."""
+        try:
+            extract_msgs = [
+                {"role": "system", "content": (
+                    "You are a concise intent extractor. Given a user's message that starts a conversation, "
+                    "produce a one-sentence interpretation of what they want to accomplish. "
+                    "Focus on the end goal, not the specific steps. "
+                    'Respond with ONLY a JSON object: {"intent": "..."}'
+                )},
+                {"role": "user", "content": message},
+            ]
+            response = await self.llm.chat(extract_msgs)
+            data = json.loads(response.content)
+            intent = data.get("intent", message)
+            self.memory.save_thread_intent(session_id, message, intent)
+        except Exception:
+            # Fallback: store the raw message as the intent
+            self.memory.save_thread_intent(session_id, message, message)
+            logger.debug("Intent extraction failed, using raw message", exc_info=True)
+
     async def _process_inner(self, message: str, session_id: str,
                               status_callback: Callable[[str, str], Any] | None = None) -> str:
         # 1. Save user message
         self.memory.save_message(session_id, "user", message)
 
-        # 2. Retrieve relevant memories
+        # 2. Extract and persist thread intent on first message in a session
+        if not self.memory.has_thread_intent(session_id):
+            await self._extract_intent(message, session_id)
+
+        # 3. Retrieve relevant memories
         memories = self.memory.search(message, top_k=self.config.memory.top_k)
         summary = self.memory.get_session_summary(session_id)
+        thread_intent = self.memory.get_thread_intent(session_id)
 
-        # 3. Build prompt
+        # 4. Build prompt
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
-        system = _build_system_prompt(memories, summary, now, self.config.agent.workspace)
-        recent = self.memory.get_recent_messages(session_id, limit=20)
+        system = _build_system_prompt(memories, summary, now, self.config.agent.workspace, thread_intent)
+        recent = self.memory.get_recent_messages(session_id, limit=self.config.agent.recent_messages)
 
-        # 4. Get available tools (native only; MCP tools accessed via meta-tools)
+        # 5. Get available tools (native only; MCP tools accessed via meta-tools)
         tools = NATIVE_TOOLS
 
-        # 5. Build message list
+        # 6. Build message list
         messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         messages.extend(recent)
 
-        # 6. Call LLM
+        # 7. Call LLM
         response = await self.llm.chat(messages, tools=tools if tools else None)
 
-        # 7. Tool call loop
+        # 8. Tool call loop
         rounds = 0
         while response.has_tool_calls() and rounds < self.max_tool_rounds:
             rounds += 1
@@ -209,7 +253,7 @@ class Agent:
             })
             response = await self.llm.chat(messages)
 
-        # 8. Thinking retry — model produced only reasoning after tool use
+        # 9. Thinking retry — model produced only reasoning after tool use
         content = response.content
         if not content and rounds > 0 and response.reasoning_content:
             log_event(logger, "thinking_retry", session_id=session_id, rounds=rounds,
@@ -226,10 +270,10 @@ class Agent:
 
         content = content or "(no response)"
 
-        # 9. Save assistant response
+        # 10. Save assistant response
         self.memory.save_message(session_id, "assistant", content)
 
-        # 10. Periodic maintenance
+        # 11. Periodic maintenance
         if self.memory.should_summarize(session_id):
             try:
                 await self.memory.summarize_and_extract(session_id, self.llm)

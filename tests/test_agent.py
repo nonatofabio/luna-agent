@@ -49,7 +49,20 @@ class TestAgent:
         config.memory.db_path = str(tmp_path / "test.db")
 
         llm = MagicMock(spec=LLMClient)
-        llm.chat = AsyncMock(return_value=LLMResponse(content="Hello!"))
+        # First call is intent extraction (returns JSON), subsequent calls return normal text
+        _intent_response = LLMResponse(content='{"intent": "test intent"}')
+        _default_response = LLMResponse(content="Hello!")
+        llm.chat = AsyncMock(side_effect=lambda *a, **kw: _intent_response
+                             if not getattr(llm, '_intent_done', False)
+                             else _default_response)
+
+        def _intent_side_effect(*a, **kw):
+            if not getattr(llm, '_intent_done', False):
+                llm._intent_done = True
+                return _intent_response
+            return _default_response
+
+        llm.chat = AsyncMock(side_effect=_intent_side_effect)
 
         memory = MemoryManager(MemoryConfig(
             db_path=str(tmp_path / "test.db"),
@@ -67,7 +80,8 @@ class TestAgent:
     async def test_basic_response(self, agent):
         result = await agent.process("Hello", "test-session")
         assert result == "Hello!"
-        agent.llm.chat.assert_called_once()
+        # 2 calls: intent extraction + actual chat
+        assert agent.llm.chat.call_count == 2
 
     async def test_saves_messages(self, agent):
         await agent.process("Hello", "test-session")
@@ -78,6 +92,7 @@ class TestAgent:
 
     async def test_thinking_retry_after_tool_rounds(self, agent):
         """When model returns only reasoning after tool use, agent retries without tools."""
+        intent_response = LLMResponse(content='{"intent": "run echo"}')
         tool_response = LLMResponse(
             content=None,
             tool_calls=[ToolCall(id="tc1", name="bash", arguments='{"command":"echo hi"}')],
@@ -87,20 +102,21 @@ class TestAgent:
         # Retry response: real content
         retry_response = LLMResponse(content="Here is the answer.")
 
-        agent.llm.chat = AsyncMock(side_effect=[tool_response, thinking_only, retry_response])
+        agent.llm.chat = AsyncMock(side_effect=[intent_response, tool_response, thinking_only, retry_response])
 
         with patch("luna.agent.call_native_tool", new_callable=AsyncMock, return_value="hi\n"):
             result = await agent.process("run echo", "test-session")
 
         assert result == "Here is the answer."
-        # 3 calls: initial, after tool, retry
-        assert agent.llm.chat.call_count == 3
+        # 4 calls: intent, initial, after tool, retry
+        assert agent.llm.chat.call_count == 4
         # Last call should have no tools (forces text)
-        last_call_kwargs = agent.llm.chat.call_args_list[2]
+        last_call_kwargs = agent.llm.chat.call_args_list[3]
         assert "tools" not in last_call_kwargs.kwargs or last_call_kwargs.kwargs.get("tools") is None
 
     async def test_no_retry_when_content_exists(self, agent):
         """No thinking retry when the model already returned content."""
+        intent_response = LLMResponse(content='{"intent": "run echo"}')
         tool_response = LLMResponse(
             content=None,
             tool_calls=[ToolCall(id="tc1", name="bash", arguments='{"command":"echo hi"}')],
@@ -111,23 +127,24 @@ class TestAgent:
             reasoning_content="Let me think...",
         )
 
-        agent.llm.chat = AsyncMock(side_effect=[tool_response, final_response])
+        agent.llm.chat = AsyncMock(side_effect=[intent_response, tool_response, final_response])
 
         with patch("luna.agent.call_native_tool", new_callable=AsyncMock, return_value="hi\n"):
             result = await agent.process("run echo", "test-session")
 
         assert result == "Got it, here's the result."
-        # Only 2 calls: initial + after tool. No retry.
-        assert agent.llm.chat.call_count == 2
+        # 3 calls: intent + initial + after tool. No retry.
+        assert agent.llm.chat.call_count == 3
 
     async def test_status_callback_called_before_tool(self, agent):
         """Status callback fires before tool execution, with correct args."""
+        intent_response = LLMResponse(content='{"intent": "list files"}')
         tool_response = LLMResponse(
             content=None,
             tool_calls=[ToolCall(id="tc1", name="bash", arguments='{"command":"ls"}')],
         )
         final_response = LLMResponse(content="Done.")
-        agent.llm.chat = AsyncMock(side_effect=[tool_response, final_response])
+        agent.llm.chat = AsyncMock(side_effect=[intent_response, tool_response, final_response])
 
         call_order = []
         status_cb = AsyncMock(side_effect=lambda n, a: call_order.append(("status", n)))
@@ -145,12 +162,13 @@ class TestAgent:
 
     async def test_status_callback_failure_ignored(self, agent):
         """If the status callback raises, the agent continues normally."""
+        intent_response = LLMResponse(content='{"intent": "list files"}')
         tool_response = LLMResponse(
             content=None,
             tool_calls=[ToolCall(id="tc1", name="bash", arguments='{"command":"ls"}')],
         )
         final_response = LLMResponse(content="Done.")
-        agent.llm.chat = AsyncMock(side_effect=[tool_response, final_response])
+        agent.llm.chat = AsyncMock(side_effect=[intent_response, tool_response, final_response])
 
         failing_cb = AsyncMock(side_effect=RuntimeError("Discord is down"))
 

@@ -52,6 +52,7 @@ class ObserveConfig:
 class AgentConfig:
     workspace: str = "data/workspace"
     allow_read_outside: bool = True
+    recent_messages: int = 50
 
 
 @dataclass

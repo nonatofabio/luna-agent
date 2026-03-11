@@ -21,6 +21,7 @@ recency_weight = 0.3
 [agent]
 workspace = "data/workspace"
 allow_read_outside = true
+recent_messages = 50
 
 [observe]
 log_dir = "data/logs"
