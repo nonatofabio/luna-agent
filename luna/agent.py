@@ -112,6 +112,34 @@ def _build_system_prompt(
     )
 
 
+_NARRATION_MIN_LEN = 200  # responses shorter than this after tool use are suspect
+
+
+def _looks_incomplete(content: str) -> bool:
+    """Detect narration fragments the model emits instead of a real answer.
+
+    After tool rounds, the model sometimes returns a short preamble like
+    "Let me fix the imports:" and stops — no tool calls, no real answer.
+    This catches those cases so the agent can re-prompt.
+    """
+    stripped = content.strip()
+    if not stripped:
+        return True
+    # Ends with colon — almost always a preamble for upcoming action
+    if stripped.endswith(":"):
+        return True
+    # Very short response after tool work is likely a fragment
+    if len(stripped) < _NARRATION_MIN_LEN:
+        # Short is OK if it looks like a deliberate short answer (e.g. "Done.", "Yes.")
+        # Heuristic: fragments tend to contain action verbs about future work
+        lower = stripped.lower()
+        action_phrases = ("let me ", "i'll ", "i will ", "let's ", "now i ")
+        if any(lower.startswith(p) or f". {p}" in lower or f", {p}" in lower
+               for p in action_phrases):
+            return True
+    return False
+
+
 class Agent:
     """The orchestrator that ties LLM, memory, and MCP tools together."""
 
@@ -253,16 +281,30 @@ class Agent:
             })
             response = await self.llm.chat(messages)
 
-        # 9. Thinking retry — model produced only reasoning after tool use
+        # 9. Incomplete response retry — model produced no content, only reasoning,
+        #    or a narration fragment (e.g. "Let me fix the imports:") after tool use
         content = response.content
-        if not content and rounds > 0 and response.reasoning_content:
-            log_event(logger, "thinking_retry", session_id=session_id, rounds=rounds,
-                      reasoning_len=len(response.reasoning_content))
+        needs_retry = False
+        retry_reason = ""
+
+        if rounds > 0:
+            if not content and response.reasoning_content:
+                needs_retry = True
+                retry_reason = "empty_with_reasoning"
+            elif content and _looks_incomplete(content):
+                needs_retry = True
+                retry_reason = "narration_fragment"
+
+        if needs_retry:
+            log_event(logger, "incomplete_retry", session_id=session_id, rounds=rounds,
+                      reason=retry_reason, content_len=len(content or ""),
+                      reasoning_len=len(response.reasoning_content or ""))
             messages.append({
                 "role": "user",
                 "content": (
-                    "You used tools and got results, but your last response was empty. "
-                    "Please summarize what you found and answer the user's question."
+                    "Your last response appears incomplete — it reads like a narration of "
+                    "what you were about to do, not a final answer. Please provide a complete "
+                    "response summarizing what you accomplished and any results."
                 ),
             })
             response = await self.llm.chat(messages)  # no tools — forces text

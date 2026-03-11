@@ -8,7 +8,7 @@ import pytest
 
 from luna.config import Config
 from luna.llm import LLMClient, LLMResponse, ToolCall
-from luna.agent import Agent, _build_system_prompt
+from luna.agent import Agent, _build_system_prompt, _looks_incomplete
 from luna.tools import verify_tool_result as _verify_tool_result
 from luna.memory import MemoryResult, MemoryManager
 
@@ -136,6 +136,27 @@ class TestAgent:
         # 3 calls: intent + initial + after tool. No retry.
         assert agent.llm.chat.call_count == 3
 
+    async def test_narration_fragment_triggers_retry(self, agent):
+        """When model returns a narration fragment after tools, agent retries."""
+        intent_response = LLMResponse(content='{"intent": "fix imports"}')
+        tool_response = LLMResponse(
+            content=None,
+            tool_calls=[ToolCall(id="tc1", name="bash", arguments='{"command":"ls"}')],
+        )
+        # After tool use: narration ending with colon — the bug pattern
+        narration = LLMResponse(content="Let me fix the imports in the pipeline:")
+        # Retry gives a real answer
+        retry_response = LLMResponse(content="I've fixed the imports and the pipeline is working.")
+
+        agent.llm.chat = AsyncMock(side_effect=[intent_response, tool_response, narration, retry_response])
+
+        with patch("luna.agent.call_native_tool", new_callable=AsyncMock, return_value="file.txt"):
+            result = await agent.process("fix imports", "test-session")
+
+        assert result == "I've fixed the imports and the pipeline is working."
+        # 4 calls: intent, initial, after tool (narration), retry
+        assert agent.llm.chat.call_count == 4
+
     async def test_status_callback_called_before_tool(self, agent):
         """Status callback fires before tool execution, with correct args."""
         intent_response = LLMResponse(content='{"intent": "list files"}')
@@ -227,3 +248,49 @@ class TestVerifyToolResult:
         verified = _verify_tool_result("web_fetch", result)
         assert "[NOTE:" in verified
         assert "DNS" in verified
+
+
+class TestLooksIncomplete:
+    def test_trailing_colon(self):
+        assert _looks_incomplete("Let me fix the imports:") is True
+
+    def test_trailing_colon_with_context(self):
+        assert _looks_incomplete("The scraper class is named RedditScraperWithAI. Let me fix the imports:") is True
+
+    def test_empty_string(self):
+        assert _looks_incomplete("") is True
+
+    def test_whitespace_only(self):
+        assert _looks_incomplete("   ") is True
+
+    def test_short_action_phrase(self):
+        assert _looks_incomplete("Let me try a different approach.") is True
+
+    def test_short_ill_phrase(self):
+        assert _looks_incomplete("I'll check the file now.") is True
+
+    def test_short_deliberate_answer(self):
+        assert _looks_incomplete("Done.") is False
+
+    def test_short_yes(self):
+        assert _looks_incomplete("Yes.") is False
+
+    def test_long_response_not_incomplete(self):
+        # 200+ chars of real content should not trigger
+        content = "I've completed the integration. " * 10
+        assert _looks_incomplete(content) is False
+
+    def test_long_response_with_colon_at_end(self):
+        # Even long responses ending with colon are suspect
+        content = "A" * 250 + ":"
+        assert _looks_incomplete(content) is True
+
+    def test_real_bug_message_267(self):
+        assert _looks_incomplete(
+            "The AI Functions are taking too long. Let me test with a simpler, quicker approach first to see if the llama-server is responding:"
+        ) is True
+
+    def test_real_bug_message_274(self):
+        assert _looks_incomplete(
+            "Let me try a more targeted approach to remove the timeout arguments:"
+        ) is True
