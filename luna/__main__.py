@@ -17,7 +17,7 @@ from luna.memory import MemoryManager
 from luna.mcp_manager import MCPManager
 from luna.agent import Agent
 from luna.discord_bot import LunaDiscordBot
-from luna.tools import init_workspace, init_tool_registry
+from luna.tools import init_workspace, init_tool_registry, init_wiki
 
 
 def _format_tool_args(name: str, arguments: str) -> str:
@@ -114,6 +114,14 @@ async def main() -> None:
     await mcp.load_servers(mcp_config_path)
     init_tool_registry(mcp)
 
+    # Initialize wiki
+    wiki = None
+    if config.wiki.enabled:
+        from luna.wiki import WikiManager
+        wiki = WikiManager(config.wiki)
+        init_wiki(wiki)
+        log_event(logger, "wiki_enabled", wiki_dir=config.wiki.wiki_dir)
+
     # Check for Discord token
     if not config.discord.token:
         log_event(logger, "cli_mode")
@@ -123,10 +131,10 @@ async def main() -> None:
             if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
                 h.setLevel(logging.WARNING)
 
-        agent = Agent(config, llm, memory, mcp, tool_callback=_print_tool_call)
+        agent = Agent(config, llm, memory, mcp, wiki=wiki, tool_callback=_print_tool_call)
         await _run_cli(agent)
     else:
-        agent = Agent(config, llm, memory, mcp)
+        agent = Agent(config, llm, memory, mcp, wiki=wiki)
 
         # Start Discord bot
         bot = LunaDiscordBot(agent)

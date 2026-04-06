@@ -36,6 +36,10 @@ Use for multi-step research, complex file operations, or anything that benefits 
 and iterates on failures. Use for scripts, scrapers, automation, or any task requiring write-run-fix cycles. \
 Prefer this over delegate for coding work.
 - **list_available_tools / use_tool**: Discover and call additional MCP tools beyond the built-ins.
+- **wiki_read / wiki_write / wiki_search**: Your persistent knowledge wiki. Read wiki pages for \
+context, write pages to record important facts/preferences/project details that should persist \
+across conversations. Use wiki_search to find relevant pages. Proactively update your wiki when \
+you learn something durable about the user, their projects, or their preferences.
 
 ## Guidelines
 - Act, don't ask. You have tools — use them. Install packages, run commands, create files, scan networks. \
@@ -62,11 +66,14 @@ When given a task that requires multiple steps (e.g., "set up X", "discover devi
 4. If something doesn't work, debug it — read errors, try alternatives, search for solutions
 5. Report what you did and what the results were
 
-## Memory
-The "Relevant Memories" section below contains facts retrieved from your long-term memory based on \
-the current conversation. These may include user preferences, past decisions, project details, or \
-previously learned facts. Not all retrieved memories will be relevant — use judgment.
+## Knowledge
+You have two knowledge systems:
+1. **Wiki** (primary) — Markdown pages you maintain with synthesized knowledge about \
+the user, projects, preferences, and past work. Relevant wiki content is included below. \
+You can also read/write wiki pages directly with wiki tools.
+2. **Memories** (legacy) — Individual facts from past conversations.
 
+{wiki_section}
 {memory_section}
 {summary_section}
 {intent_section}
@@ -81,7 +88,12 @@ def _build_system_prompt(
     current_time: str,
     workspace: str = "",
     thread_intent: dict[str, str] | None = None,
+    wiki_context: str = "",
 ) -> str:
+    wiki_section = ""
+    if wiki_context:
+        wiki_section = f"## Wiki Knowledge\n{wiki_context}"
+
     memory_section = ""
     if memories:
         mem_lines = []
@@ -104,6 +116,7 @@ def _build_system_prompt(
         )
 
     return SYSTEM_PROMPT_TEMPLATE.format(
+        wiki_section=wiki_section,
         memory_section=memory_section,
         summary_section=summary_section,
         intent_section=intent_section,
@@ -149,12 +162,14 @@ class Agent:
         llm: LLMClient,
         memory: MemoryManager,
         mcp: MCPManager,
+        wiki=None,
         tool_callback: Callable[[str, str, str], None] | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
         self.memory = memory
         self.mcp = mcp
+        self.wiki = wiki
         self.max_tool_rounds = 30  # safety limit on tool call loops
         self.tool_callback = tool_callback
 
@@ -198,15 +213,25 @@ class Agent:
         if not self.memory.has_thread_intent(session_id):
             await self._extract_intent(message, session_id)
 
-        # 3. Retrieve relevant memories
+        # 3. Retrieve relevant memories and wiki context
         memories = self.memory.search(message, top_k=self.config.memory.top_k)
         summary = self.memory.get_session_summary(session_id)
         thread_intent = self.memory.get_thread_intent(session_id)
 
+        wiki_context = ""
+        if self.wiki and self.wiki.enabled:
+            try:
+                wiki_context = await self.wiki.query(message, llm=self.llm)
+            except Exception:
+                logger.debug("Wiki query failed", exc_info=True)
+
         # 4. Build prompt
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
-        system = _build_system_prompt(memories, summary, now, self.config.agent.workspace, thread_intent)
+        system = _build_system_prompt(
+            memories, summary, now, self.config.agent.workspace,
+            thread_intent, wiki_context=wiki_context,
+        )
         recent = self.memory.get_recent_messages(session_id, limit=self.config.agent.recent_messages)
 
         # 5. Get available tools (native only; MCP tools accessed via meta-tools)
@@ -298,7 +323,8 @@ class Agent:
         if needs_retry:
             log_event(logger, "incomplete_retry", session_id=session_id, rounds=rounds,
                       reason=retry_reason, content_len=len(content or ""),
-                      reasoning_len=len(response.reasoning_content or ""))
+                      reasoning_len=len(response.reasoning_content or ""),
+                      content_preview=(content or "")[:200])
             messages.append({
                 "role": "user",
                 "content": (
@@ -322,6 +348,17 @@ class Agent:
             except Exception:
                 logger.exception("Background summarization failed")
 
+            if self.wiki and self.wiki.enabled:
+                try:
+                    conv_msgs = self.memory.get_recent_messages(session_id, limit=20)
+                    conversation = "\n".join(
+                        f"{m['role']}: {m['content']}" for m in conv_msgs
+                    )
+                    await self.wiki.ingest(conversation, session_id, self.llm)
+                except Exception:
+                    logger.exception("Wiki ingest failed")
+
         log_event(logger, "agent_response", session_id=session_id,
-                  memory_hits=len(memories), tool_rounds=rounds)
+                  memory_hits=len(memories), tool_rounds=rounds,
+                  response_preview=content[:300] if content else "(empty)")
         return content

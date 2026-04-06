@@ -42,7 +42,8 @@ class TestToolRegistry:
         assert names == {
             "bash", "read_file", "write_file", "list_directory",
             "web_fetch", "web_search", "list_available_tools", "use_tool",
-            "summarize_paper", "delegate", "code_task",
+            "summarize_paper", "delegate", "code_task", "run_newsletter",
+            "wiki_read", "wiki_write", "wiki_search",
         }
 
     def test_is_native_tool(self):

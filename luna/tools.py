@@ -66,11 +66,20 @@ _allow_read_outside: bool = True
 # MCP manager — set by init_tool_registry() at startup
 _mcp_manager: "MCPManager | None" = None
 
+# Wiki manager — set by init_wiki() at startup
+_wiki_manager: "WikiManager | None" = None
+
 
 def init_tool_registry(mcp: "MCPManager") -> None:
     """Register the MCP manager so meta-tools can discover and call MCP tools."""
     global _mcp_manager
     _mcp_manager = mcp
+
+
+def init_wiki(wiki: "WikiManager") -> None:
+    """Register the wiki manager so wiki tools can operate."""
+    global _wiki_manager
+    _wiki_manager = wiki
 
 
 def init_workspace(workspace: str, allow_read_outside: bool = True) -> None:
@@ -379,6 +388,93 @@ NATIVE_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_newsletter",
+            "description": (
+                "Run the 'Last Week on Autonomous AI' multi-source newsletter pipeline. "
+                "Fetches content from Reddit, arXiv, newsletters, and GitHub, ranks it with "
+                "AI Functions, and generates a Markdown newsletter. Returns the pipeline "
+                "summary and path to the generated newsletter file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max_items_per_source": {
+                        "type": "integer",
+                        "description": "Maximum items to fetch per source (default 5).",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wiki_read",
+            "description": (
+                "Read a page from your persistent knowledge wiki. Use 'index.md' to browse "
+                "available pages. The wiki contains synthesized knowledge about the user, "
+                "projects, preferences, and past work."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Page path relative to wiki root (e.g., 'index.md', 'homelab-setup.md').",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wiki_write",
+            "description": (
+                "Create or update a page in your persistent knowledge wiki. Use this to record "
+                "important facts, preferences, project details, or decisions that should persist "
+                "across conversations. Always check the index first to avoid duplicates."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Page path relative to wiki root (e.g., 'homelab-setup.md').",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full markdown content for the page.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wiki_search",
+            "description": (
+                "Search the wiki for pages relevant to a query. Returns matching page "
+                "content from the most relevant pages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for in the wiki.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 _NATIVE_TOOL_NAMES: set[str] = {t["function"]["name"] for t in NATIVE_TOOLS}
@@ -404,11 +500,26 @@ async def call_native_tool(
     if handler is None:
         return f"Error: Unknown native tool '{name}'"
 
-    log_event(logger, "native_tool_call", tool=name)
+    # Log arguments (truncate large values to keep logs manageable)
+    safe_args = {}
+    for k, v in arguments.items():
+        s = str(v)
+        safe_args[k] = s[:500] if len(s) > 500 else s
+    log_event(logger, "native_tool_call", tool=name, arguments=safe_args)
     try:
-        return await handler(arguments, context=context, llm=llm, root=root)
+        result = await handler(arguments, context=context, llm=llm, root=root)
+        log_event(
+            logger,
+            "native_tool_result",
+            tool=name,
+            result_len=len(result),
+            result_preview=result[:500] if len(result) > 500 else result,
+            success=True,
+        )
+        return result
     except Exception as e:
         logger.exception(f"Native tool error: {name}")
+        log_event(logger, "native_tool_result", tool=name, error=str(e), success=False)
         return f"Error executing {name}: {e}"
 
 
@@ -842,7 +953,7 @@ async def _tool_summarize_paper(args: dict, context: str = "", llm=None, root=No
 
 # --- Delegate sub-agent ---
 
-_DELEGATE_ALLOWED_TOOLS = {"bash", "read_file", "write_file", "list_directory", "web_search", "web_fetch", "summarize_paper"}
+_DELEGATE_ALLOWED_TOOLS = {"bash", "read_file", "write_file", "list_directory", "web_search", "web_fetch", "summarize_paper", "wiki_read", "wiki_search"}
 _DELEGATE_MAX_ROUNDS = 5
 
 _DELEGATE_SYSTEM_PROMPT = """\
@@ -934,6 +1045,7 @@ async def _tool_delegate(args: dict, context: str = "", llm=None, root=None, **k
 _CODE_TASK_ALLOWED_TOOLS = {
     "bash", "read_file", "write_file", "list_directory",
     "web_search", "web_fetch",
+    "wiki_read", "wiki_write", "wiki_search",
 }
 _CODE_TASK_MAX_ROUNDS = 25
 
@@ -1056,6 +1168,140 @@ async def _tool_code_task(args: dict, context: str = "", llm=None, root=None, **
     return final
 
 
+# --- Newsletter pipeline ---
+
+_NEWSLETTER_DIR = "newsletter"
+_NEWSLETTER_TIMEOUT = 900  # 15 minutes — pipeline makes many sequential LLM calls
+
+
+async def run_newsletter_pipeline(
+    max_items: int = 5,
+    workspace: Path | None = None,
+) -> str:
+    """Run the multi-source newsletter pipeline. Callable from tools or directly.
+
+    Returns a formatted result string.
+    """
+    newsletter_dir = (workspace or Path("data/workspace")) / _NEWSLETTER_DIR
+
+    if not (newsletter_dir / "multi_source_pipeline.py").exists():
+        return f"Error: Newsletter pipeline not found at {newsletter_dir}"
+
+    log_event(logger, "newsletter_start", max_items=max_items, directory=str(newsletter_dir))
+
+    cmd = (
+        f"cd {newsletter_dir} && "
+        f"python3 -c \""
+        f"import json; "
+        f"from multi_source_pipeline import MultiSourceNewsletterPipeline; "
+        f"p = MultiSourceNewsletterPipeline(); "
+        f"s = p.run(output_dir='output', max_items_per_source={int(max_items)}); "
+        f"print('---JSON_SUMMARY---'); "
+        f"print(json.dumps(s, indent=2, default=str))"
+        f"\""
+    )
+
+    try:
+        proc, stdout, stderr, rc = await asyncio.to_thread(
+            _run_in_pgroup, cmd, str(newsletter_dir), _NEWSLETTER_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        log_event(logger, "newsletter_timeout", timeout=_NEWSLETTER_TIMEOUT)
+        return f"Error: Newsletter pipeline timed out after {_NEWSLETTER_TIMEOUT}s."
+
+    if rc != 0:
+        log_event(logger, "newsletter_error", exit_code=rc, stderr=stderr[:500])
+        return f"Newsletter pipeline failed (exit code {rc}):\n{stderr[:2000]}\n{stdout[-1000:]}"
+
+    # Extract the JSON summary from stdout
+    summary_json = ""
+    if "---JSON_SUMMARY---" in stdout:
+        summary_json = stdout.split("---JSON_SUMMARY---", 1)[1].strip()
+
+    if summary_json:
+        try:
+            summary = json.loads(summary_json)
+            newsletter_path = summary.get("output_files", {}).get("newsletter", "")
+            sources_path = summary.get("output_files", {}).get("sources", "")
+            log_event(logger, "newsletter_complete",
+                      total_sources=summary.get("total_sources", 0),
+                      newsletter_items=summary.get("newsletter_items", 0),
+                      duration=summary.get("duration_seconds", 0),
+                      newsletter_path=newsletter_path)
+
+            result = (
+                f"Newsletter pipeline completed successfully!\n\n"
+                f"**Sources fetched:** {summary.get('total_sources', 0)}\n"
+                f"**High quality items:** {summary.get('high_quality_sources', 0)}\n"
+                f"**Newsletter items:** {summary.get('newsletter_items', 0)}\n"
+                f"**Duration:** {summary.get('duration_seconds', 0):.1f}s\n\n"
+                f"**Breakdown:**\n"
+            )
+            breakdown = summary.get("sources_breakdown", {})
+            for source, count in breakdown.items():
+                result += f"  - {source}: {count}\n"
+
+            result += f"\n**Newsletter file:** {newsletter_path}\n"
+            result += f"**Sources file:** {sources_path}\n"
+
+            return result
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: return raw output
+    log_event(logger, "newsletter_complete_raw", stdout_len=len(stdout))
+    return f"Newsletter pipeline output:\n{stdout[-3000:]}"
+
+
+async def _tool_run_newsletter(args: dict, context: str = "", root: Path | None = None, **kwargs) -> str:
+    """Tool wrapper for run_newsletter_pipeline."""
+    max_items = args.get("max_items_per_source", 5)
+    return await run_newsletter_pipeline(max_items=max_items, workspace=root)
+
+
+# --- Wiki tools ---
+
+
+async def _tool_wiki_read(args: dict, **kwargs) -> str:
+    if _wiki_manager is None:
+        return "Error: Wiki is not enabled."
+    page_path = args.get("path", "index.md")
+    try:
+        return _wiki_manager.read_page(page_path)
+    except FileNotFoundError:
+        return f"Error: Wiki page not found: {page_path}"
+    except ValueError as e:
+        return f"Error: {e}"
+
+
+async def _tool_wiki_write(args: dict, **kwargs) -> str:
+    if _wiki_manager is None:
+        return "Error: Wiki is not enabled."
+    page_path = args.get("path", "")
+    content = args.get("content", "")
+    if not page_path:
+        return "Error: 'path' is required."
+    if not content:
+        return "Error: 'content' is required."
+    try:
+        _wiki_manager.write_page(page_path, content)
+        return f"Wiki page written: {page_path}"
+    except ValueError as e:
+        return f"Error: {e}"
+
+
+async def _tool_wiki_search(args: dict, **kwargs) -> str:
+    if _wiki_manager is None:
+        return "Error: Wiki is not enabled."
+    query = args.get("query", "")
+    if not query:
+        return "Error: 'query' is required."
+    # wiki_search uses sync keyword matching (no LLM expansion in tool context)
+    import asyncio
+    result = await _wiki_manager.query(query)
+    return result if result else "No matching wiki pages found."
+
+
 # --- Registry ---
 
 _TOOL_REGISTRY: dict[str, Any] = {
@@ -1070,4 +1316,8 @@ _TOOL_REGISTRY: dict[str, Any] = {
     "summarize_paper": _tool_summarize_paper,
     "delegate": _tool_delegate,
     "code_task": _tool_code_task,
+    "run_newsletter": _tool_run_newsletter,
+    "wiki_read": _tool_wiki_read,
+    "wiki_write": _tool_wiki_write,
+    "wiki_search": _tool_wiki_search,
 }

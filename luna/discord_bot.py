@@ -9,6 +9,7 @@ import discord
 
 from luna.agent import Agent
 from luna.observe import get_logger, log_event
+import luna.tools as tools_module
 
 logger = get_logger("discord")
 
@@ -176,6 +177,11 @@ class LunaDiscordBot(discord.Client):
         if not content:
             return
 
+        # --- Direct commands (bypass LLM entirely) ---
+        if content.startswith("!"):
+            await self._handle_command(message, content)
+            return
+
         session_id = _session_id_for(message)
         log_event(logger, "discord_message", session_id=session_id,
                   author=str(message.author), channel=str(message.channel))
@@ -200,3 +206,48 @@ class LunaDiscordBot(discord.Client):
         chunks = _split_message(response)
         for chunk in chunks:
             await message.reply(chunk, mention_author=False)
+
+    async def _handle_command(self, message: discord.Message, content: str) -> None:
+        """Handle !commands that bypass the LLM."""
+        parts = content.split(None, 1)
+        cmd = parts[0].lower()
+        # args = parts[1] if len(parts) > 1 else ""
+
+        if cmd == "!newsletter":
+            log_event(logger, "direct_command", command="newsletter",
+                      author=str(message.author))
+            status_msg = await message.reply(
+                "**Running newsletter pipeline...** This may take a few minutes.",
+                mention_author=False,
+            )
+            try:
+                result = await tools_module.run_newsletter_pipeline(
+                    workspace=tools_module._workspace,
+                )
+            except Exception as e:
+                logger.exception("Newsletter command failed")
+                result = f"Newsletter pipeline error: {e}"
+
+            # Delete the "running" message and post the result
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            chunks = _split_message(result)
+            for chunk in chunks:
+                await message.reply(chunk, mention_author=False)
+
+        elif cmd == "!help":
+            await message.reply(
+                "**Available commands:**\n"
+                "`!newsletter` — Run the newsletter pipeline (no LLM needed)\n"
+                "`!help` — Show this message\n\n"
+                "Everything else goes through Luna's AI agent.",
+                mention_author=False,
+            )
+
+        else:
+            await message.reply(
+                f"Unknown command `{cmd}`. Use `!help` to see available commands.",
+                mention_author=False,
+            )
