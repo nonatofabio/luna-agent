@@ -69,6 +69,9 @@ _mcp_manager: "MCPManager | None" = None
 # Wiki manager — set by init_wiki() at startup
 _wiki_manager: "WikiManager | None" = None
 
+# Memory manager — set by init_memory() at startup
+_memory_manager: "MemoryManager | None" = None
+
 
 def init_tool_registry(mcp: "MCPManager") -> None:
     """Register the MCP manager so meta-tools can discover and call MCP tools."""
@@ -80,6 +83,12 @@ def init_wiki(wiki: "WikiManager") -> None:
     """Register the wiki manager so wiki tools can operate."""
     global _wiki_manager
     _wiki_manager = wiki
+
+
+def init_memory(memory: "MemoryManager") -> None:
+    """Register the memory manager so recall/diff tools can operate."""
+    global _memory_manager
+    _memory_manager = memory
 
 
 def init_workspace(workspace: str, allow_read_outside: bool = True) -> None:
@@ -458,6 +467,46 @@ NATIVE_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "ask_claude_code",
+            "description": (
+                "Collaborate with Claude Code (Anthropic's frontier coding agent) on a task. "
+                "Claude Code can autonomously edit files, run commands, search the web, and "
+                "iterate on errors — it excels at write-run-fix cycles you struggle with. "
+                "Use for: complex coding requiring iterative debugging, work with unfamiliar "
+                "APIs/frameworks, long multi-step autonomous tasks, or anything where code_task "
+                "failed or would likely fail. "
+                "COST WARNING: Uses Anthropic API credits (~$0.01-2.00 per task). Do NOT use "
+                "for trivial tasks you can handle yourself. Escalation hierarchy: try yourself "
+                "first, then code_task, then ask_claude_code only when needed. "
+                "To continue a previous conversation, pass the session_id from a prior call."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Clear description of the task or follow-up message.",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Background context, constraints, or relevant information.",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID from a previous ask_claude_code call to continue that conversation.",
+                    },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "Working directory for Claude Code (default: workspace).",
+                    },
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "wiki_search",
             "description": (
                 "Search the wiki for pages relevant to a query. Returns matching page "
@@ -472,6 +521,53 @@ NATIVE_TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall",
+            "description": (
+                "Search your long-term memory for relevant facts and context. "
+                "Call this whenever you need historical context, the topic shifts, "
+                "or you want to check what you know about something. "
+                "Searches across ALL sessions and channels."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for in memory.",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum number of results (default 10).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "diff",
+            "description": (
+                "Compare a file's current content against the last version you read. "
+                "Shows a unified diff of what changed. Use this to see what was modified "
+                "in a file since you last looked at it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to diff.",
+                    },
+                },
+                "required": ["path"],
             },
         },
     },
@@ -628,16 +724,26 @@ async def _tool_read_file(args: dict, context: str = "", llm=None, root=None, **
     offset = args.get("offset", 0)
     limit = args.get("limit")
 
+    # Track file reads for change detection
+    change_note = ""
+    if _memory_manager is not None:
+        changed, last_seen = _memory_manager.check_file_changed(str(path), content)
+        if changed and last_seen is not None:
+            from datetime import datetime, timezone
+            ts = datetime.fromtimestamp(last_seen, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            change_note = f"[NOTE: This file has changed since you last read it at {ts}.]\n\n"
+        _memory_manager.record_file_read(str(path), content)
+
     if offset or limit:
         lines = content.splitlines(keepends=True)
         end = offset + limit if limit else len(lines)
         content = "".join(lines[offset:end])
-        # If we sliced, return directly (user was specific)
-        return content
+        return change_note + content if change_note else content
 
-    return await process_large_output(
+    result = await process_large_output(
         content, context or path_str, f"read_file_{path.name}", llm, root=root
     )
+    return change_note + result if change_note else result
 
 
 async def _tool_write_file(args: dict, **kwargs) -> str:
@@ -953,7 +1059,7 @@ async def _tool_summarize_paper(args: dict, context: str = "", llm=None, root=No
 
 # --- Delegate sub-agent ---
 
-_DELEGATE_ALLOWED_TOOLS = {"bash", "read_file", "write_file", "list_directory", "web_search", "web_fetch", "summarize_paper", "wiki_read", "wiki_search"}
+_DELEGATE_ALLOWED_TOOLS = {"bash", "read_file", "write_file", "list_directory", "web_search", "web_fetch", "summarize_paper", "wiki_read", "wiki_search", "recall"}
 _DELEGATE_MAX_ROUNDS = 5
 
 _DELEGATE_SYSTEM_PROMPT = """\
@@ -1046,6 +1152,7 @@ _CODE_TASK_ALLOWED_TOOLS = {
     "bash", "read_file", "write_file", "list_directory",
     "web_search", "web_fetch",
     "wiki_read", "wiki_write", "wiki_search",
+    "recall",
 }
 _CODE_TASK_MAX_ROUNDS = 25
 
@@ -1259,6 +1366,83 @@ async def _tool_run_newsletter(args: dict, context: str = "", root: Path | None 
     return await run_newsletter_pipeline(max_items=max_items, workspace=root)
 
 
+# --- Claude Code collaboration ---
+
+
+async def _tool_ask_claude_code(args: dict, context: str = "", **kwargs) -> str:
+    task = args.get("task", "")
+    if not task:
+        return "Error: 'task' is required"
+
+    from luna.claude_code import get_session_manager, ClaudeCodeError
+
+    manager = get_session_manager()
+    if manager is None:
+        return "Error: Claude Code integration is not enabled."
+
+    session_id = args.get("session_id")
+    session = None
+
+    try:
+        if session_id:
+            # Continue an existing conversation
+            session = manager.get_session(session_id)
+            if session is None:
+                return (
+                    f"Error: Session {session_id[:8]}... not found or expired. "
+                    "Start a new session by omitting session_id."
+                )
+            message = task
+        else:
+            # Start a new session
+            working_dir = args.get("working_dir")
+            if not working_dir:
+                working_dir = str(_workspace) if _workspace else "."
+
+            session = await manager.create_session(working_dir)
+
+            # Build a rich initial prompt with context
+            parts = [task]
+            extra_context = args.get("context", "")
+            if extra_context:
+                parts.append(f"\n\nAdditional context:\n{extra_context}")
+            message = "\n".join(parts)
+
+        response = await session.send(message)
+
+        # Register session after first send (that's when session_id is assigned)
+        if not session_id and session.session_id:
+            manager.register_session(session)
+
+        # Format the result
+        result_parts = [response.result]
+        result_parts.append("\n---")
+        result_parts.append(f"Session: {response.session_id} (pass as session_id to continue)")
+        if response.tool_calls_made:
+            # Summarize tool usage
+            from collections import Counter
+            counts = Counter(response.tool_calls_made)
+            tool_summary = ", ".join(
+                f"{name}({count})" if count > 1 else name
+                for name, count in counts.items()
+            )
+            result_parts.append(f"Tools used: {tool_summary}")
+        if response.cost_usd is not None:
+            result_parts.append(f"Cost: ${response.cost_usd:.4f}")
+        if response.duration_ms is not None:
+            result_parts.append(f"Duration: {response.duration_ms / 1000:.1f}s")
+        if response.is_error:
+            result_parts.insert(0, "**[Claude Code reported an error]**\n")
+
+        return "\n".join(result_parts)
+
+    except ClaudeCodeError as e:
+        return f"Claude Code error: {e}"
+    except Exception as e:
+        log_event(logger, "ask_claude_code_error", error=str(e))
+        return f"Unexpected error communicating with Claude Code: {e}"
+
+
 # --- Wiki tools ---
 
 
@@ -1267,7 +1451,19 @@ async def _tool_wiki_read(args: dict, **kwargs) -> str:
         return "Error: Wiki is not enabled."
     page_path = args.get("path", "index.md")
     try:
-        return _wiki_manager.read_page(page_path)
+        content = _wiki_manager.read_page(page_path)
+        # Track wiki reads for change detection
+        if _memory_manager is not None:
+            full_path = str(_wiki_manager._validate_path(page_path))
+            changed, last_seen = _memory_manager.check_file_changed(full_path, content)
+            note = ""
+            if changed and last_seen is not None:
+                from datetime import datetime, timezone
+                ts = datetime.fromtimestamp(last_seen, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                note = f"[NOTE: This wiki page has changed since you last read it at {ts}.]\n\n"
+            _memory_manager.record_file_read(full_path, content)
+            return note + content
+        return content
     except FileNotFoundError:
         return f"Error: Wiki page not found: {page_path}"
     except ValueError as e:
@@ -1285,6 +1481,10 @@ async def _tool_wiki_write(args: dict, **kwargs) -> str:
         return "Error: 'content' is required."
     try:
         _wiki_manager.write_page(page_path, content)
+        # Record snapshot so we know what we wrote
+        if _memory_manager is not None:
+            full_path = str(_wiki_manager._validate_path(page_path))
+            _memory_manager.record_file_read(full_path, content)
         return f"Wiki page written: {page_path}"
     except ValueError as e:
         return f"Error: {e}"
@@ -1302,6 +1502,64 @@ async def _tool_wiki_search(args: dict, **kwargs) -> str:
     return result if result else "No matching wiki pages found."
 
 
+# --- Memory tools ---
+
+
+async def _tool_recall(args: dict, **kwargs) -> str:
+    if _memory_manager is None:
+        return "Error: Memory manager not available."
+    query = args.get("query", "")
+    if not query:
+        return "Error: 'query' is required."
+    top_k = args.get("top_k", 10)
+    results = _memory_manager.search(query, top_k=top_k)
+    if not results:
+        return "No matching memories found."
+    lines = [f"Found {len(results)} memories:"]
+    for r in results:
+        lines.append(f"- [{r.memory_type}] {r.content} (importance: {r.importance})")
+    return "\n".join(lines)
+
+
+async def _tool_diff(args: dict, **kwargs) -> str:
+    import difflib
+    import hashlib
+
+    if _memory_manager is None:
+        return "Error: Memory manager not available."
+    path_str = args.get("path", "")
+    if not path_str:
+        return "Error: 'path' is required."
+
+    path = _resolve_path(path_str)
+    if not path.exists():
+        return f"Error: File not found: {path}"
+
+    snapshot = _memory_manager.get_file_snapshot_content(str(path))
+    if snapshot is None:
+        return f"No previous snapshot for this file. Read it first with read_file or wiki_read."
+
+    old_content, last_seen = snapshot
+    try:
+        current_content = path.read_text(encoding="utf-8", errors="replace")
+    except PermissionError:
+        return f"Error: Permission denied: {path}"
+
+    if hashlib.sha256(current_content.encode()).hexdigest() == hashlib.sha256(old_content.encode()).hexdigest():
+        return "No changes detected."
+
+    from datetime import datetime, timezone
+    ts = datetime.fromtimestamp(last_seen, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    diff_lines = list(difflib.unified_diff(
+        old_content.splitlines(keepends=True),
+        current_content.splitlines(keepends=True),
+        fromfile=f"{path} (last seen {ts})",
+        tofile=f"{path} (current)",
+    ))
+    return "".join(diff_lines) if diff_lines else "No changes detected."
+
+
 # --- Registry ---
 
 _TOOL_REGISTRY: dict[str, Any] = {
@@ -1317,7 +1575,10 @@ _TOOL_REGISTRY: dict[str, Any] = {
     "delegate": _tool_delegate,
     "code_task": _tool_code_task,
     "run_newsletter": _tool_run_newsletter,
+    "ask_claude_code": _tool_ask_claude_code,
     "wiki_read": _tool_wiki_read,
     "wiki_write": _tool_wiki_write,
     "wiki_search": _tool_wiki_search,
+    "recall": _tool_recall,
+    "diff": _tool_diff,
 }

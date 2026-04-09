@@ -14,27 +14,34 @@ from luna.memory import MemoryResult, MemoryManager
 
 
 class TestSystemPrompt:
-    def test_empty_memories(self):
-        prompt = _build_system_prompt([], None, "2026-01-01T00:00:00Z")
+    def test_basic_prompt(self):
+        prompt = _build_system_prompt(None, "2026-01-01T00:00:00Z")
         assert "Luna" in prompt
         assert "2026-01-01" in prompt
-
-    def test_with_memories(self):
-        memories = [
-            MemoryResult(id=1, content="User likes Python", memory_type="fact",
-                         importance=7.0, score=0.9, created_at=0),
-        ]
-        prompt = _build_system_prompt(memories, None, "2026-01-01T00:00:00Z")
-        assert "User likes Python" in prompt
-        assert "[fact]" in prompt
+        assert "recall" in prompt
 
     def test_with_summary(self):
-        prompt = _build_system_prompt([], "They discussed AI.", "2026-01-01T00:00:00Z")
+        prompt = _build_system_prompt("They discussed AI.", "2026-01-01T00:00:00Z")
         assert "They discussed AI." in prompt
 
     def test_with_workspace(self):
-        prompt = _build_system_prompt([], None, "2026-01-01T00:00:00Z", workspace="/home/fabio/workspace")
-        assert "/home/fabio/workspace" in prompt
+        prompt = _build_system_prompt(None, "2026-01-01T00:00:00Z", workspace="/tmp/test-workspace")
+        assert "/tmp/test-workspace" in prompt
+
+    def test_with_wiki_context(self):
+        prompt = _build_system_prompt(None, "2026-01-01T00:00:00Z", wiki_context="Dual RTX 3090 GPUs")
+        assert "Dual RTX 3090 GPUs" in prompt
+        assert "Wiki Knowledge" in prompt
+
+    def test_with_related_intents(self):
+        intents = [{"session_id": "ch-paper-channel", "interpreted_intent": "Indexing trading papers"}]
+        prompt = _build_system_prompt(None, "2026-01-01T00:00:00Z", related_intents=intents)
+        assert "Related Threads" in prompt
+        assert "Indexing trading papers" in prompt
+
+    def test_empty_related_intents(self):
+        prompt = _build_system_prompt(None, "2026-01-01T00:00:00Z", related_intents=[])
+        assert "Related Threads" not in prompt
 
 
 class TestAgent:

@@ -84,6 +84,15 @@ def _format_status(tool_name: str, arguments: str) -> str:
         if len(task) > 80:
             task = task[:77] + "..."
         return f"\U0001f916 {task}"
+    if tool_name == "ask_claude_code":
+        task = args.get("task", arguments)
+        sid = args.get("session_id", "")
+        prefix = "\U0001f9e0 Claude Code: "
+        if sid:
+            prefix = f"\U0001f9e0 Claude Code ({sid[:8]}...): "
+        if len(task) > 60:
+            task = task[:57] + "..."
+        return prefix + task
     if tool_name == "use_tool":
         return f"\U0001f527 Using {args.get('name', arguments)}"
     return f"\u2699\ufe0f {tool_name}..."

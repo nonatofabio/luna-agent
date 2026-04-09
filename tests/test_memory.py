@@ -116,3 +116,63 @@ class TestSummaries:
 
     def test_no_summary_returns_none(self, memory):
         assert memory.get_session_summary("nonexistent") is None
+
+
+class TestFileSnapshots:
+    def test_record_and_check_unchanged(self, memory):
+        memory.record_file_read("/tmp/f.txt", "hello")
+        changed, ts = memory.check_file_changed("/tmp/f.txt", "hello")
+        assert changed is False
+        assert ts is not None
+
+    def test_check_detects_change(self, memory):
+        memory.record_file_read("/tmp/f.txt", "v1")
+        changed, ts = memory.check_file_changed("/tmp/f.txt", "v2")
+        assert changed is True
+        assert ts is not None
+
+    def test_check_unknown_file(self, memory):
+        changed, ts = memory.check_file_changed("/tmp/never.txt", "content")
+        assert changed is False
+        assert ts is None
+
+    def test_record_updates_snapshot(self, memory):
+        memory.record_file_read("/tmp/f.txt", "v1")
+        memory.record_file_read("/tmp/f.txt", "v2")
+        changed, _ = memory.check_file_changed("/tmp/f.txt", "v2")
+        assert changed is False
+
+    def test_get_snapshot_content(self, memory):
+        memory.record_file_read("/tmp/f.txt", "hello world")
+        result = memory.get_file_snapshot_content("/tmp/f.txt")
+        assert result is not None
+        content, ts = result
+        assert content == "hello world"
+        assert ts > 0
+
+    def test_get_snapshot_content_unknown(self, memory):
+        assert memory.get_file_snapshot_content("/tmp/nope.txt") is None
+
+
+class TestRelatedIntents:
+    def test_finds_related_intents(self, memory):
+        memory.save_thread_intent("s1", "index trading papers", "User is indexing finance papers")
+        memory.save_thread_intent("s2", "homelab setup", "User is configuring homelab hardware")
+        results = memory.search_related_intents("finance trading stocks", exclude_session="s3")
+        assert len(results) >= 1
+        assert results[0]["session_id"] == "s1"
+
+    def test_excludes_current_session(self, memory):
+        memory.save_thread_intent("s1", "trading papers", "finance and trading")
+        results = memory.search_related_intents("trading", exclude_session="s1")
+        assert len(results) == 0
+
+    def test_empty_intents(self, memory):
+        results = memory.search_related_intents("anything", exclude_session="s1")
+        assert results == []
+
+    def test_limit_respected(self, memory):
+        for i in range(5):
+            memory.save_thread_intent(f"s{i}", f"topic {i} python", f"intent {i} about python")
+        results = memory.search_related_intents("python", exclude_session="s99", limit=2)
+        assert len(results) == 2

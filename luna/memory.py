@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import sqlite3
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,10 +59,19 @@ CREATE TABLE IF NOT EXISTS thread_intents (
     updated_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS file_snapshots (
+    id INTEGER PRIMARY KEY,
+    file_path TEXT NOT NULL UNIQUE,
+    content_hash TEXT NOT NULL,
+    content TEXT NOT NULL,
+    last_seen REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
 CREATE INDEX IF NOT EXISTS idx_thread_intents_session ON thread_intents(session_id);
+CREATE INDEX IF NOT EXISTS idx_file_snapshots_path ON file_snapshots(file_path);
 """
 
 FTS_SQL = """
@@ -92,6 +104,20 @@ class MemoryResult:
     importance: float
     score: float  # combined retrieval score
     created_at: float
+
+
+_STOPWORDS = frozenset(
+    "a an the is are was were be been being have has had do does did "
+    "will would shall should may might can could of in to for on with "
+    "at by from as into about between through and or but not no nor "
+    "so yet both each all any some this that these those it its i me "
+    "my we our you your he she they them his her".split()
+)
+
+
+def _tokenize_intent(text: str) -> list[str]:
+    """Tokenize text for intent keyword matching."""
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in _STOPWORDS]
 
 
 class MemoryManager:
@@ -436,6 +462,83 @@ class MemoryManager:
                       facts_extracted=len(data.get("facts", [])))
         except Exception:
             logger.exception("Failed to summarize/extract")
+
+    # --- File Snapshots ---
+
+    def record_file_read(self, path: str, content: str) -> None:
+        """Record a hash + content snapshot of a file Luna has read."""
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        now = time.time()
+        self.db.execute(
+            "INSERT INTO file_snapshots (file_path, content_hash, content, last_seen) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(file_path) DO UPDATE SET "
+            "content_hash = excluded.content_hash, content = excluded.content, "
+            "last_seen = excluded.last_seen",
+            (path, content_hash, content, now),
+        )
+        self.db.commit()
+
+    def check_file_changed(self, path: str, content: str) -> tuple[bool, float | None]:
+        """Check if file content differs from last snapshot.
+
+        Returns (changed, last_seen_timestamp). If never seen, returns (False, None).
+        """
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        row = self.db.execute(
+            "SELECT content_hash, last_seen FROM file_snapshots WHERE file_path = ?",
+            (path,),
+        ).fetchone()
+        if row is None:
+            return (False, None)
+        return (row[0] != content_hash, row[1])
+
+    def get_file_snapshot_content(self, path: str) -> tuple[str, float] | None:
+        """Get the last-seen content and timestamp for a file."""
+        row = self.db.execute(
+            "SELECT content, last_seen FROM file_snapshots WHERE file_path = ?",
+            (path,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (row[0], row[1])
+
+    # --- Cross-Session Intent Search ---
+
+    def search_related_intents(
+        self, query: str, exclude_session: str, limit: int = 3,
+    ) -> list[dict]:
+        """Find thread intents from other sessions relevant to the query."""
+        rows = self.db.execute(
+            "SELECT session_id, original_request, interpreted_intent "
+            "FROM thread_intents WHERE session_id != ?",
+            (exclude_session,),
+        ).fetchall()
+        if not rows:
+            return []
+
+        query_tokens = _tokenize_intent(query)
+        if not query_tokens:
+            return []
+
+        scored: list[tuple[float, dict]] = []
+        for session_id, original_request, interpreted_intent in rows:
+            text = f"{original_request} {interpreted_intent}"
+            entry_tokens = _tokenize_intent(text)
+            if not entry_tokens:
+                continue
+            entry_counts = Counter(entry_tokens)
+            score = sum(entry_counts.get(t, 0) for t in query_tokens)
+            score /= len(entry_tokens) ** 0.5
+            if score > 0:
+                scored.append((score, {
+                    "session_id": session_id,
+                    "original_request": original_request,
+                    "interpreted_intent": interpreted_intent,
+                }))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in scored[:limit]]
 
     def close(self) -> None:
         self.db.close()

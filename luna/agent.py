@@ -35,6 +35,13 @@ Use for multi-step research, complex file operations, or anything that benefits 
 - **code_task**: Delegate a coding task to a sub-agent that writes code, runs it, checks results, \
 and iterates on failures. Use for scripts, scrapers, automation, or any task requiring write-run-fix cycles. \
 Prefer this over delegate for coding work.
+- **ask_claude_code**: Collaborate with Claude Code (Anthropic's frontier coding agent) for tasks \
+requiring iterative debugging, unfamiliar APIs, or complex multi-step coding. Claude Code autonomously \
+edits files, runs commands, and fixes its own mistakes — it excels at the write-run-fix cycles you \
+struggle with. EXPENSIVE — uses Anthropic API credits. Escalation hierarchy: try yourself first, \
+then code_task, then ask_claude_code only when needed. You can continue a conversation by passing \
+the session_id from a prior call. When Claude Code finishes, review its work and report results \
+to the user.
 - **list_available_tools / use_tool**: Discover and call additional MCP tools beyond the built-ins.
 - **wiki_read / wiki_write / wiki_search**: Your persistent knowledge wiki. Read wiki pages for \
 context, write pages to record important facts/preferences/project details that should persist \
@@ -71,35 +78,32 @@ You have two knowledge systems:
 1. **Wiki** (primary) — Markdown pages you maintain with synthesized knowledge about \
 the user, projects, preferences, and past work. Relevant wiki content is included below. \
 You can also read/write wiki pages directly with wiki tools.
-2. **Memories** (legacy) — Individual facts from past conversations.
+2. **Memory** — Individual facts from past conversations. Use the `recall` tool to search \
+your long-term memory when you need context. Call it whenever the topic shifts, you need \
+historical context, or you want to check what you know about something. It searches across \
+ALL sessions and channels.
+- **diff**: Compare any file against the last version you read to see what changed.
 
 {wiki_section}
-{memory_section}
 {summary_section}
 {intent_section}
+{related_section}
 
 Current time: {current_time}
 Workspace: {workspace}"""
 
 
 def _build_system_prompt(
-    memories: list,
     summary: str | None,
     current_time: str,
     workspace: str = "",
     thread_intent: dict[str, str] | None = None,
     wiki_context: str = "",
+    related_intents: list[dict] | None = None,
 ) -> str:
     wiki_section = ""
     if wiki_context:
         wiki_section = f"## Wiki Knowledge\n{wiki_context}"
-
-    memory_section = ""
-    if memories:
-        mem_lines = []
-        for m in memories:
-            mem_lines.append(f"- [{m.memory_type}] {m.content}")
-        memory_section = "## Relevant Memories\n" + "\n".join(mem_lines)
 
     summary_section = ""
     if summary:
@@ -115,11 +119,19 @@ def _build_system_prompt(
             "should advance this goal."
         )
 
+    related_section = ""
+    if related_intents:
+        lines = ["## Related Threads",
+                 "Other active conversations that may be relevant:"]
+        for ri in related_intents:
+            lines.append(f"- [{ri['session_id'][:20]}] {ri['interpreted_intent']}")
+        related_section = "\n".join(lines)
+
     return SYSTEM_PROMPT_TEMPLATE.format(
         wiki_section=wiki_section,
-        memory_section=memory_section,
         summary_section=summary_section,
         intent_section=intent_section,
+        related_section=related_section,
         current_time=current_time,
         workspace=workspace,
     )
@@ -213,10 +225,12 @@ class Agent:
         if not self.memory.has_thread_intent(session_id):
             await self._extract_intent(message, session_id)
 
-        # 3. Retrieve relevant memories and wiki context
-        memories = self.memory.search(message, top_k=self.config.memory.top_k)
+        # 3. Retrieve context (wiki, summary, intents)
         summary = self.memory.get_session_summary(session_id)
         thread_intent = self.memory.get_thread_intent(session_id)
+
+        # Cross-session intent sharing
+        related_intents = self.memory.search_related_intents(message, session_id)
 
         wiki_context = ""
         if self.wiki and self.wiki.enabled:
@@ -229,8 +243,9 @@ class Agent:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         system = _build_system_prompt(
-            memories, summary, now, self.config.agent.workspace,
+            summary, now, self.config.agent.workspace,
             thread_intent, wiki_context=wiki_context,
+            related_intents=related_intents,
         )
         recent = self.memory.get_recent_messages(session_id, limit=self.config.agent.recent_messages)
 
@@ -359,6 +374,6 @@ class Agent:
                     logger.exception("Wiki ingest failed")
 
         log_event(logger, "agent_response", session_id=session_id,
-                  memory_hits=len(memories), tool_rounds=rounds,
+                  related_intents=len(related_intents), tool_rounds=rounds,
                   response_preview=content[:300] if content else "(empty)")
         return content

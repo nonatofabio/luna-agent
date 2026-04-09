@@ -17,7 +17,7 @@ from luna.memory import MemoryManager
 from luna.mcp_manager import MCPManager
 from luna.agent import Agent
 from luna.discord_bot import LunaDiscordBot
-from luna.tools import init_workspace, init_tool_registry, init_wiki
+from luna.tools import init_workspace, init_tool_registry, init_wiki, init_memory
 
 
 def _format_tool_args(name: str, arguments: str) -> str:
@@ -39,6 +39,10 @@ def _format_tool_args(name: str, arguments: str) -> str:
         return args["url"]
     if name in ("delegate", "code_task") and "task" in args:
         return args["task"]
+    if name == "ask_claude_code" and "task" in args:
+        sid = args.get("session_id", "")
+        prefix = f"(continuing {sid[:8]}...) " if sid else ""
+        return prefix + args["task"]
 
     # Fallback: first string value or raw length
     for v in args.values():
@@ -113,6 +117,7 @@ async def main() -> None:
     mcp_config_path = config.root_dir / "mcp_servers.json"
     await mcp.load_servers(mcp_config_path)
     init_tool_registry(mcp)
+    init_memory(memory)
 
     # Initialize wiki
     wiki = None
@@ -121,6 +126,12 @@ async def main() -> None:
         wiki = WikiManager(config.wiki)
         init_wiki(wiki)
         log_event(logger, "wiki_enabled", wiki_dir=config.wiki.wiki_dir)
+
+    # Initialize Claude Code integration
+    if config.claude_code.enabled:
+        from luna.claude_code import init_claude_code
+        init_claude_code(config.claude_code)
+        log_event(logger, "claude_code_enabled")
 
     # Check for Discord token
     if not config.discord.token:
@@ -148,6 +159,9 @@ async def main() -> None:
             await bot.close()
 
     # Cleanup
+    if config.claude_code.enabled:
+        from luna.claude_code import shutdown_claude_code
+        await shutdown_claude_code()
     await mcp.close()
     memory.close()
     log_event(logger, "shutdown")

@@ -56,6 +56,16 @@ class AgentConfig:
 
 
 @dataclass
+class ClaudeCodeConfig:
+    enabled: bool = True
+    max_sessions: int = 3
+    session_timeout: int = 600       # seconds of inactivity before expiry
+    turn_timeout: int = 300          # seconds per turn
+    max_budget_usd: float = 2.0      # per-session cost cap
+    claude_path: str = "claude"      # path to claude CLI binary
+
+
+@dataclass
 class WikiConfig:
     wiki_dir: str = "data/wiki"
     enabled: bool = True
@@ -72,6 +82,7 @@ class Config:
     observe: ObserveConfig = field(default_factory=ObserveConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     wiki: WikiConfig = field(default_factory=WikiConfig)
+    claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     root_dir: Path = _ROOT
 
 
@@ -104,6 +115,8 @@ def load_config(config_path: Path | None = None) -> Config:
             _apply_section(cfg.agent, raw["agent"])
         if "wiki" in raw:
             _apply_section(cfg.wiki, raw["wiki"])
+        if "claude_code" in raw:
+            _apply_section(cfg.claude_code, raw["claude_code"])
 
     # Env var overrides
     if token := os.environ.get("DISCORD_TOKEN"):
@@ -118,6 +131,8 @@ def load_config(config_path: Path | None = None) -> Config:
         cfg.observe.log_dir = log_dir
     if wiki_dir := os.environ.get("WIKI_DIR"):
         cfg.wiki.wiki_dir = wiki_dir
+    if claude_path := os.environ.get("CLAUDE_PATH"):
+        cfg.claude_code.claude_path = claude_path
 
     # Resolve relative paths against project root
     if not Path(cfg.memory.db_path).is_absolute():

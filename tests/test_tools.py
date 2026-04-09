@@ -43,7 +43,8 @@ class TestToolRegistry:
             "bash", "read_file", "write_file", "list_directory",
             "web_fetch", "web_search", "list_available_tools", "use_tool",
             "summarize_paper", "delegate", "code_task", "run_newsletter",
-            "wiki_read", "wiki_write", "wiki_search",
+            "ask_claude_code", "wiki_read", "wiki_write", "wiki_search",
+            "recall", "diff",
         }
 
     def test_is_native_tool(self):

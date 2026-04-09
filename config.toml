@@ -23,6 +23,14 @@ workspace = "data/workspace"
 allow_read_outside = true
 recent_messages = 50
 
+[claude_code]
+enabled = true
+max_sessions = 3
+session_timeout = 600
+turn_timeout = 300
+max_budget_usd = 2.0
+# claude_path defaults to "claude" (looked up on PATH); override if needed
+
 [observe]
 log_dir = "data/logs"
 log_level = "INFO"
