@@ -874,17 +874,77 @@ async def _tool_web_search(args: dict, context: str = "", llm=None, root=None, *
     if not query:
         return "Error: 'query' is required"
 
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        return "Error: duckduckgo-search package not installed. Run: pip install duckduckgo-search"
+    provider = os.getenv("WEB_SEARCH_PROVIDER", "duckduckgo").strip().lower()
+    youcom_key = os.getenv("YOUCOM_SEARCH_API_KEY")
 
-    try:
-        results = await asyncio.to_thread(
-            lambda: list(DDGS().text(query, max_results=max_results))
-        )
-    except Exception as e:
-        return f"Error searching: {e}"
+    async def _search_duckduckgo() -> tuple[list[dict[str, str]], str | None]:
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            return [], "Error: duckduckgo-search package not installed. Run: pip install duckduckgo-search"
+
+        try:
+            results = await asyncio.to_thread(
+                lambda: list(DDGS().text(query, max_results=max_results))
+            )
+        except Exception as e:
+            return [], f"Error searching DuckDuckGo: {e}"
+
+        normalized = [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("href", ""),
+                "snippet": r.get("body", ""),
+            }
+            for r in results
+        ]
+        return normalized, None
+
+    async def _search_youcom(api_key: str) -> tuple[list[dict[str, str]], str | None]:
+        import httpx
+
+        url = "https://api.ydc-index.io/search"
+        headers = {"X-API-Key": api_key}
+        params = {"query": query, "num_web_results": max_results}
+
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as e:
+            return [], f"Error searching You.com: {e}"
+
+        # Support multiple payload shapes for compatibility across API versions.
+        candidates = payload.get("hits") or payload.get("results") or payload.get("items") or []
+        normalized: list[dict[str, str]] = []
+        for item in candidates:
+            title = item.get("title") or item.get("name") or ""
+            url_value = item.get("url") or item.get("link") or ""
+            snippets = item.get("snippets") or []
+            snippet = " ".join(snippets) if isinstance(snippets, list) else str(snippets)
+            if not snippet:
+                snippet = item.get("description") or item.get("body") or ""
+            normalized.append({"title": title, "url": url_value, "snippet": snippet})
+
+        return normalized, None
+
+    notes: list[str] = []
+    if provider in {"you", "youcom", "you.com"}:
+        if not youcom_key:
+            notes.append("[NOTE: YOUCOM_SEARCH_API_KEY not set; falling back to DuckDuckGo.]")
+            results, error = await _search_duckduckgo()
+        else:
+            results, error = await _search_youcom(youcom_key)
+            if error:
+                notes.append(f"[NOTE: {error} Falling back to DuckDuckGo.]")
+                results, ddg_error = await _search_duckduckgo()
+                error = ddg_error
+    else:
+        results, error = await _search_duckduckgo()
+
+    if error and not results:
+        return error
 
     if not results:
         return "No results found."
@@ -892,11 +952,13 @@ async def _tool_web_search(args: dict, context: str = "", llm=None, root=None, *
     output_parts: list[str] = []
     for i, r in enumerate(results, 1):
         title = r.get("title", "")
-        href = r.get("href", "")
-        body = r.get("body", "")
+        href = r.get("url", "")
+        body = r.get("snippet", "")
         output_parts.append(f"{i}. **{title}**\n   {href}\n   {body}")
 
     output = "\n\n".join(output_parts)
+    if notes:
+        output = "\n".join(notes) + "\n\n" + output
     return await process_large_output(output, context or query, f"web_search_{query[:30]}", llm, root=root)
 
 

@@ -125,8 +125,21 @@ All settings live in `config.toml`. Environment variables override for secrets:
 | `LLM_MODEL` | `[llm] model` | No |
 | `MEMORY_DB_PATH` | `[memory] db_path` | No |
 | `LOG_DIR` | `[observe] log_dir` | No |
+| `WEB_SEARCH_PROVIDER` | Web search backend (`duckduckgo` or `youcom`) | No |
+| `YOUCOM_SEARCH_API_KEY` | API key for You.com web search (`X-API-Key`) | No |
 
 See `config.toml` for all available settings and their defaults.
+
+### Web search provider setup
+
+By default, `web_search` uses DuckDuckGo. To use You.com Search API:
+
+```bash
+export WEB_SEARCH_PROVIDER=youcom
+export YOUCOM_SEARCH_API_KEY=your_api_key_here
+```
+
+Fallback behavior: if You.com is selected but the API key is missing (or the API request fails), Luna falls back to DuckDuckGo and annotates the tool result.
 
 ## Components
 
@@ -191,7 +204,7 @@ Built-in tools that don't require external MCP servers:
 | `write_file` | Write or append to files, creates parent directories |
 | `list_directory` | List files/directories, optional recursion with depth limits |
 | `web_fetch` | Fetch a URL and convert HTML to markdown via html2text |
-| `web_search` | Search the web via DuckDuckGo, returns structured results |
+| `web_search` | Search the web via DuckDuckGo (default) or You.com (`WEB_SEARCH_PROVIDER=youcom`) |
 | `delegate` | Hand off a self-contained subtask to a sub-agent with its own tool loop |
 | `code_task` | Delegate a coding task to a sub-agent with a write-run-fix loop |
 | `summarize_paper` | Fetch and summarize an arXiv paper |
