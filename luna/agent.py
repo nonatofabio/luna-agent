@@ -64,6 +64,22 @@ But reading, installing, scanning, and creating are safe — just do them.
 - When you don't know something, look it up (web_search, web_fetch, read docs) rather than guessing \
 or asking the user.
 - For file creation, use relative paths — they resolve to the workspace below.
+- **Report current state, not intent.** When you respond after using tools, describe what you \
+*did* (past tense) and what the *current state* is — not what you plan to do. If your tools wrote \
+files, say "I created X" and list them. If a job is still running in the background, say "I started \
+X, it's running" — not "I'll start X." Never say "I'll have it ready in a moment" after your tools \
+have run: by the time you respond, either it's done (say what you did) or something blocked you \
+(say what blocked you).
+- **Verify before claiming absence.** Before telling the user you haven't done something they're \
+asking about, CHECK. Use `recall` to search your memory across sessions. Use `list_directory` \
+and `read_file` to inspect the filesystem. Use `bash` to run `git status` or `git log` to see \
+prior work. Only say "I haven't built X yet" after you have actually looked and not found it. \
+Do NOT restart work from scratch just because you don't immediately remember doing it.
+- **New modules are not live until restart.** If you (or Claude Code on your behalf) add new \
+Python modules, tools, or services to the luna-agent codebase, they are NOT imported into \
+your currently-running process. You cannot call a new tool you just wrote — it won't be in \
+your tool registry until Fabio runs `sudo systemctl restart luna-agent`. Report this as a \
+required step and do not try to test code that isn't loaded yet.
 
 ## Approach
 When given a task that requires multiple steps (e.g., "set up X", "discover devices", "install and test Y"):
@@ -139,13 +155,88 @@ def _build_system_prompt(
 
 _NARRATION_MIN_LEN = 200  # responses shorter than this after tool use are suspect
 
+# Future-tense markers that indicate the model is promising upcoming work
+# instead of reporting what it already did.
+_FUTURE_TENSE_MARKERS = (
+    "i'll have it ready",
+    "i will have it ready",
+    "in a moment",
+    "momentarily",
+    "in just a moment",
+    "will take a few minutes",
+    "will take a moment",
+    "give me a moment",
+    "give me a minute",
+    "i'm going to build",
+    "i'm going to create",
+    "i'm going to write",
+    "i'm building ",
+    "i'm creating ",
+    "i'm writing ",
+    "i will build",
+    "i will create",
+    "i will write",
+    "i'll build",
+    "i'll create",
+    "i'll write",
+    "i'll delegate",
+    "i will delegate",
+    "let me create",
+    "let me write",
+    "let me build",
+    "let me delegate",
+    "i'll have it",
+    "will be ready",
+)
 
-def _looks_incomplete(content: str) -> bool:
+# Past-tense / result-reporting markers that indicate the model is
+# grounding its response in work it actually completed. Kept strict —
+# first-person past-tense verbs and explicit completion signals only,
+# to avoid matching generic nouns ("the file") that appear in any
+# conversational sentence.
+_GROUNDED_MARKERS = (
+    "i created ",
+    "i wrote ",
+    "i built ",
+    "i ran ",
+    "i tested ",
+    "i verified ",
+    "i checked ",
+    "i installed ",
+    "i added ",
+    "i modified ",
+    "i edited ",
+    "i fixed ",
+    "i found ",
+    "i confirmed ",
+    "i've created",
+    "i've written",
+    "i've built",
+    "i've added",
+    "i've run",
+    "i started ",  # e.g. "I started the build in the background"
+    "here's what i",
+    "here is what i",
+    "now contains",
+    "it's running",
+    "it is running",
+    "successfully",
+    "✅",
+    "## summary",
+    "**summary",
+)
+
+
+def _looks_incomplete(content: str, rounds: int = 0) -> bool:
     """Detect narration fragments the model emits instead of a real answer.
 
-    After tool rounds, the model sometimes returns a short preamble like
-    "Let me fix the imports:" and stops — no tool calls, no real answer.
-    This catches those cases so the agent can re-prompt.
+    After tool rounds, the model sometimes returns a preamble describing
+    upcoming work instead of reporting what it already did. This catches
+    those cases so the agent can re-prompt with a grounding retry.
+
+    The ``rounds`` argument gates the stricter future-tense detection to
+    post-tool responses — a greeting or first-message answer is legitimately
+    forward-looking and should not be flagged.
     """
     stripped = content.strip()
     if not stripped:
@@ -153,14 +244,25 @@ def _looks_incomplete(content: str) -> bool:
     # Ends with colon — almost always a preamble for upcoming action
     if stripped.endswith(":"):
         return True
-    # Very short response after tool work is likely a fragment
-    if len(stripped) < _NARRATION_MIN_LEN:
+    lower = stripped.lower()
+    has_grounding = any(m in lower for m in _GROUNDED_MARKERS)
+    # Very short response after tool work is likely a fragment.
+    # Exception: if the response contains past-tense grounding markers, it
+    # is probably a legitimate terse report ("I started X, it's running")
+    # and should not be flagged just for being short.
+    if len(stripped) < _NARRATION_MIN_LEN and not has_grounding:
         # Short is OK if it looks like a deliberate short answer (e.g. "Done.", "Yes.")
         # Heuristic: fragments tend to contain action verbs about future work
-        lower = stripped.lower()
         action_phrases = ("let me ", "i'll ", "i will ", "let's ", "now i ")
         if any(lower.startswith(p) or f". {p}" in lower or f", {p}" in lower
                for p in action_phrases):
+            return True
+    # After tool rounds, longer future-tense narration is also suspect:
+    # the model is promising work instead of reporting it. Only flag if
+    # the message is future-tense AND lacks past-tense grounding markers.
+    if rounds > 0:
+        has_future = any(m in lower for m in _FUTURE_TENSE_MARKERS)
+        if has_future and not has_grounding:
             return True
     return False
 
@@ -331,7 +433,7 @@ class Agent:
             if not content and response.reasoning_content:
                 needs_retry = True
                 retry_reason = "empty_with_reasoning"
-            elif content and _looks_incomplete(content):
+            elif content and _looks_incomplete(content, rounds=rounds):
                 needs_retry = True
                 retry_reason = "narration_fragment"
 
@@ -343,9 +445,14 @@ class Agent:
             messages.append({
                 "role": "user",
                 "content": (
-                    "Your last response appears incomplete — it reads like a narration of "
-                    "what you were about to do, not a final answer. Please provide a complete "
-                    "response summarizing what you accomplished and any results."
+                    "Your last response reads like narration of upcoming work, but your "
+                    "tool calls have already executed — the work above this message has "
+                    "already happened. Do NOT start fresh or re-delegate. Instead: look at "
+                    "the tool results above and report, in past tense, what you actually "
+                    "accomplished. What files now exist? What did each tool call return? "
+                    "What is the current state? If you are unsure whether previous work "
+                    "exists, verify it first with read_file, list_directory, or recall — "
+                    "do not assume it doesn't exist."
                 ),
             })
             response = await self.llm.chat(messages)  # no tools — forces text

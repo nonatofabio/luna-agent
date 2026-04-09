@@ -301,3 +301,83 @@ class TestLooksIncomplete:
         assert _looks_incomplete(
             "Let me try a more targeted approach to remove the timeout arguments:"
         ) is True
+
+    # --- Long future-tense narration (rounds > 0 gate) ---
+
+    def test_vision_build_narration_msg_379(self):
+        """Real failure from msg 379: confident future-tense narration after tool use."""
+        content = (
+            "I'm building the vision system for you now! This will take a few minutes "
+            "to write, test, and verify. Let me create:\n\n"
+            "1. **Vision Service** - Webcam capture and image analysis\n"
+            "2. **LLM Vision Client** - Integration with llama-server + cloud fallback\n"
+            "3. **Web Interface** - Simple UI to capture and view images\n"
+            "4. **Test Scripts** - Verify everything works\n\n"
+            "I'll have it ready in a moment! 🎥🤖"
+        )
+        # Before fix: length > 200, no trailing colon, slipped past detection.
+        # After fix: future-tense markers + no grounding + rounds > 0 -> flagged.
+        assert _looks_incomplete(content, rounds=3) is True
+
+    def test_vision_rebuild_narration_msg_381(self):
+        """Real failure from msg 381: hallucinated regression after retry."""
+        content = (
+            "You're right - I haven't built the vision system yet! Let me create it "
+            "now with Claude Code's help. I'll delegate this to Claude Code to build "
+            "a complete vision system for you."
+        )
+        assert _looks_incomplete(content, rounds=2) is True
+
+    def test_future_tense_narration_not_flagged_without_rounds(self):
+        """The rounds-gated future-tense detector must not fire before any tool use.
+        A pre-tool response that happens to contain future-tense language but is
+        otherwise a legitimate conversational reply should pass."""
+        content = (
+            "Sure, I can help with that. The vision system is a reasonable next "
+            "step given the new webcam. Before diving in, I want to confirm a few "
+            "things with you about the scope — should it support video capture or "
+            "just still images? Do you want a web UI or just Discord replies?"
+        )
+        # Length > 200, no trailing colon, no grounding markers, but rounds=0
+        # means the future-tense detector doesn't apply. Pre-existing heuristics
+        # also don't trip because there's no short-action-phrase pattern.
+        assert _looks_incomplete(content, rounds=0) is False
+
+    def test_grounded_past_tense_after_tools_is_ok(self):
+        """Past-tense reporting after tool use should NOT be flagged."""
+        content = (
+            "I created the vision system. I wrote luna/vision.py with a VisionService "
+            "class, added 5 new tools to luna/tools.py, and verified the config loads. "
+            "The tests pass. You'll need to restart luna-agent to pick up the new modules."
+        )
+        assert _looks_incomplete(content, rounds=3) is False
+
+    def test_mixed_past_and_future_is_ok(self):
+        """If the response reports what was done AND mentions future steps, it's grounded."""
+        content = (
+            "I built the vision system — luna/vision.py is now 280 lines with webcam "
+            "capture and LLM analysis. I'll also update the wiki page to document the "
+            "new tools, but the core work is done and the files exist."
+        )
+        assert _looks_incomplete(content, rounds=3) is False
+
+    def test_forward_compat_background_task_reporting(self):
+        """Forward-compatibility guard: when background tasks ship (Issue B),
+        'I started X, it's running' must remain a valid terminal response."""
+        content = (
+            "I started the vision build in the background and it's running now. "
+            "I'll notify you in this channel when the tests finish. The task ID "
+            "is bg-vision-7a3f if you want to check status."
+        )
+        # "it's running" is a grounding marker — this must not be flagged.
+        assert _looks_incomplete(content, rounds=2) is False
+
+    def test_future_tense_without_grounding_flagged(self):
+        """A long message with only future-tense promises and no grounding is flagged."""
+        content = (
+            "Great question! I'm going to build a comprehensive solution for you. "
+            "Let me create the service, write the tests, and set up the integration. "
+            "I'll have it ready in a moment — this will take a few minutes to get right. "
+            "Let me write the first file now and we'll iterate from there."
+        )
+        assert _looks_incomplete(content, rounds=2) is True
