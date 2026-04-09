@@ -17,7 +17,7 @@ from luna.memory import MemoryManager
 from luna.mcp_manager import MCPManager
 from luna.agent import Agent
 from luna.discord_bot import LunaDiscordBot
-from luna.tools import init_workspace, init_tool_registry, init_wiki, init_memory
+from luna.tools import init_workspace, init_tool_registry, init_wiki, init_memory, init_vision
 
 
 def _format_tool_args(name: str, arguments: str) -> str:
@@ -39,6 +39,8 @@ def _format_tool_args(name: str, arguments: str) -> str:
         return args["url"]
     if name in ("delegate", "code_task") and "task" in args:
         return args["task"]
+    if name.startswith("vision_") and "image_path" in args:
+        return args["image_path"]
     if name == "ask_claude_code" and "task" in args:
         sid = args.get("session_id", "")
         prefix = f"(continuing {sid[:8]}...) " if sid else ""
@@ -119,6 +121,14 @@ async def main() -> None:
     init_tool_registry(mcp)
     init_memory(memory)
 
+    # Initialize vision system
+    vision = None
+    if config.vision.enabled:
+        from luna.vision import VisionService
+        vision = VisionService(config.vision, config.llm)
+        init_vision(vision)
+        log_event(logger, "vision_enabled", device=config.vision.device)
+
     # Initialize wiki
     wiki = None
     if config.wiki.enabled:
@@ -159,6 +169,8 @@ async def main() -> None:
             await bot.close()
 
     # Cleanup
+    if vision is not None:
+        vision.close()
     if config.claude_code.enabled:
         from luna.claude_code import shutdown_claude_code
         await shutdown_claude_code()

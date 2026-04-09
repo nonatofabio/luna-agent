@@ -72,6 +72,9 @@ _wiki_manager: "WikiManager | None" = None
 # Memory manager — set by init_memory() at startup
 _memory_manager: "MemoryManager | None" = None
 
+# Vision service — set by init_vision() at startup
+_vision_service: "VisionService | None" = None
+
 
 def init_tool_registry(mcp: "MCPManager") -> None:
     """Register the MCP manager so meta-tools can discover and call MCP tools."""
@@ -89,6 +92,12 @@ def init_memory(memory: "MemoryManager") -> None:
     """Register the memory manager so recall/diff tools can operate."""
     global _memory_manager
     _memory_manager = memory
+
+
+def init_vision(vision: "VisionService") -> None:
+    """Register the vision service so vision tools can operate."""
+    global _vision_service
+    _vision_service = vision
 
 
 def init_workspace(workspace: str, allow_read_outside: bool = True) -> None:
@@ -568,6 +577,102 @@ NATIVE_TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vision_capture",
+            "description": (
+                "Capture an image from the USB webcam. Returns the file path of "
+                "the saved image. Use this to take a photo of what the camera sees."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional filename for the capture (auto-generated if omitted).",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vision_analyze",
+            "description": (
+                "Analyze an image using a vision LLM. Describe the scene, objects, "
+                "and details. Can capture from the webcam if no image_path is given."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "Path to image file. If omitted, captures from webcam first.",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Custom analysis prompt (default: general scene description).",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vision_detect_objects",
+            "description": (
+                "Detect and list all objects visible in an image. Uses vision LLM "
+                "for recognition. Can capture from webcam if no image_path is given."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "Path to image file. If omitted, captures from webcam first.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vision_extract_text",
+            "description": (
+                "Extract text (OCR) from an image using a vision LLM. "
+                "Can capture from webcam if no image_path is given."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "Path to image file. If omitted, captures from webcam first.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vision_list_captures",
+            "description": "List recent images captured by the vision system.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max images to list (default 20).",
+                    },
+                },
             },
         },
     },
@@ -1560,6 +1665,73 @@ async def _tool_diff(args: dict, **kwargs) -> str:
     return "".join(diff_lines) if diff_lines else "No changes detected."
 
 
+# --- Vision tools ---
+
+
+async def _tool_vision_capture(args: dict, **kwargs) -> str:
+    if _vision_service is None:
+        return "Error: Vision system not enabled. Set [vision] enabled = true in config.toml."
+    filename = args.get("filename")
+    try:
+        path = await _vision_service.capture_image(filename)
+        return f"Image captured: {path}"
+    except RuntimeError as e:
+        return f"Error: {e}"
+
+
+async def _tool_vision_analyze(args: dict, **kwargs) -> str:
+    if _vision_service is None:
+        return "Error: Vision system not enabled. Set [vision] enabled = true in config.toml."
+    image_path = args.get("image_path", "")
+    prompt = args.get("prompt")
+    try:
+        if not image_path:
+            return await _vision_service.capture_and_analyze(prompt)
+        return await _vision_service.analyze_image(image_path, prompt)
+    except RuntimeError as e:
+        return f"Error: {e}"
+
+
+async def _tool_vision_detect_objects(args: dict, **kwargs) -> str:
+    if _vision_service is None:
+        return "Error: Vision system not enabled. Set [vision] enabled = true in config.toml."
+    image_path = args.get("image_path", "")
+    try:
+        if not image_path:
+            path = await _vision_service.capture_image()
+            image_path = path
+        return await _vision_service.detect_objects(image_path)
+    except RuntimeError as e:
+        return f"Error: {e}"
+
+
+async def _tool_vision_extract_text(args: dict, **kwargs) -> str:
+    if _vision_service is None:
+        return "Error: Vision system not enabled. Set [vision] enabled = true in config.toml."
+    image_path = args.get("image_path", "")
+    try:
+        if not image_path:
+            path = await _vision_service.capture_image()
+            image_path = path
+        return await _vision_service.extract_text(image_path)
+    except RuntimeError as e:
+        return f"Error: {e}"
+
+
+async def _tool_vision_list_captures(args: dict, **kwargs) -> str:
+    if _vision_service is None:
+        return "Error: Vision system not enabled. Set [vision] enabled = true in config.toml."
+    limit = args.get("limit", 20)
+    captures = _vision_service.list_captures(limit)
+    if not captures:
+        return "No captured images found."
+    lines = [f"Found {len(captures)} captures:"]
+    for c in captures:
+        lines.append(f"- {c['filename']} ({c['size_kb']} KB, {c['captured_at']})")
+        lines.append(f"  Path: {c['path']}")
+    return "\n".join(lines)
+
+
 # --- Registry ---
 
 _TOOL_REGISTRY: dict[str, Any] = {
@@ -1581,4 +1753,9 @@ _TOOL_REGISTRY: dict[str, Any] = {
     "wiki_search": _tool_wiki_search,
     "recall": _tool_recall,
     "diff": _tool_diff,
+    "vision_capture": _tool_vision_capture,
+    "vision_analyze": _tool_vision_analyze,
+    "vision_detect_objects": _tool_vision_detect_objects,
+    "vision_extract_text": _tool_vision_extract_text,
+    "vision_list_captures": _tool_vision_list_captures,
 }

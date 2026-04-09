@@ -66,6 +66,19 @@ class ClaudeCodeConfig:
 
 
 @dataclass
+class VisionConfig:
+    enabled: bool = False
+    device: int = 0                   # /dev/videoN index
+    capture_dir: str = "data/vision"  # where captured images are saved
+    width: int = 1280
+    height: int = 720
+    llm_endpoint: str = ""            # vision LLM endpoint (empty = use main LLM)
+    llm_model: str = ""               # vision model name (empty = use main LLM model)
+    fallback_api_key: str = ""        # OpenAI API key for GPT-4o fallback
+    serve_port: int = 8900            # port to serve captured images for sharing
+
+
+@dataclass
 class WikiConfig:
     wiki_dir: str = "data/wiki"
     enabled: bool = True
@@ -81,6 +94,7 @@ class Config:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     observe: ObserveConfig = field(default_factory=ObserveConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    vision: VisionConfig = field(default_factory=VisionConfig)
     wiki: WikiConfig = field(default_factory=WikiConfig)
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     root_dir: Path = _ROOT
@@ -113,6 +127,8 @@ def load_config(config_path: Path | None = None) -> Config:
             _apply_section(cfg.observe, raw["observe"])
         if "agent" in raw:
             _apply_section(cfg.agent, raw["agent"])
+        if "vision" in raw:
+            _apply_section(cfg.vision, raw["vision"])
         if "wiki" in raw:
             _apply_section(cfg.wiki, raw["wiki"])
         if "claude_code" in raw:
@@ -133,6 +149,8 @@ def load_config(config_path: Path | None = None) -> Config:
         cfg.wiki.wiki_dir = wiki_dir
     if claude_path := os.environ.get("CLAUDE_PATH"):
         cfg.claude_code.claude_path = claude_path
+    if vision_api_key := os.environ.get("OPENAI_API_KEY"):
+        cfg.vision.fallback_api_key = vision_api_key
 
     # Resolve relative paths against project root
     if not Path(cfg.memory.db_path).is_absolute():
@@ -143,5 +161,7 @@ def load_config(config_path: Path | None = None) -> Config:
         cfg.agent.workspace = str(cfg.root_dir / cfg.agent.workspace)
     if not Path(cfg.wiki.wiki_dir).is_absolute():
         cfg.wiki.wiki_dir = str(cfg.root_dir / cfg.wiki.wiki_dir)
+    if not Path(cfg.vision.capture_dir).is_absolute():
+        cfg.vision.capture_dir = str(cfg.root_dir / cfg.vision.capture_dir)
 
     return cfg

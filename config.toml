@@ -31,6 +31,16 @@ turn_timeout = 300
 max_budget_usd = 2.0
 # claude_path defaults to "claude" (looked up on PATH); override if needed
 
+[vision]
+enabled = true
+device = 0                # /dev/video0
+capture_dir = "data/vision"
+width = 1280
+height = 720
+# llm_endpoint = ""      # empty = use main LLM endpoint
+# llm_model = ""          # empty = use main LLM model
+# fallback_api_key = ""   # set OPENAI_API_KEY env var for GPT-4o fallback
+
 [observe]
 log_dir = "data/logs"
 log_level = "INFO"
