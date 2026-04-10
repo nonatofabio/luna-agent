@@ -10,6 +10,7 @@ from luna.config import Config
 from luna.llm import LLMClient
 from luna.memory import MemoryManager
 from luna.mcp_manager import MCPManager
+from luna.detection import PhantomWorkDetector
 from luna.observe import get_logger, log_event, log_duration
 from luna.tools import NATIVE_TOOLS, is_native_tool, call_native_tool, verify_tool_result
 
@@ -286,6 +287,7 @@ class Agent:
         self.wiki = wiki
         self.max_tool_rounds = 30  # safety limit on tool call loops
         self.tool_callback = tool_callback
+        self._detector = PhantomWorkDetector()
 
     async def process(
         self,
@@ -423,11 +425,14 @@ class Agent:
             })
             response = await self.llm.chat(messages)
 
-        # 9. Incomplete response retry — model produced no content, only reasoning,
-        #    or a narration fragment (e.g. "Let me fix the imports:") after tool use
+        # 9. Incomplete response retry — three independent checks:
+        #    a) Empty with reasoning only (rounds > 0)
+        #    b) Truncation / narration fragment via _looks_incomplete (rounds > 0)
+        #    c) Phantom-work claim via IoU detector (any rounds, primarily rounds == 0)
         content = response.content
         needs_retry = False
         retry_reason = ""
+        retry_msg = ""
 
         if rounds > 0:
             if not content and response.reasoning_content:
@@ -437,14 +442,38 @@ class Agent:
                 needs_retry = True
                 retry_reason = "narration_fragment"
 
+        # Phantom-work detection — runs regardless of rounds
+        if content and not needs_retry:
+            detection = self._detector.check(content, tool_rounds=rounds)
+            if detection.is_phantom:
+                needs_retry = True
+                retry_reason = f"phantom_work_{detection.method}"
+                log_event(logger, "phantom_detected",
+                          session_id=session_id,
+                          iou_score=detection.phantom_score_iou,
+                          matched_ref=detection.matched_reference_iou[:100],
+                          tool_rounds=rounds,
+                          content_preview=content[:200])
+
         if needs_retry:
             log_event(logger, "incomplete_retry", session_id=session_id, rounds=rounds,
                       reason=retry_reason, content_len=len(content or ""),
                       reasoning_len=len(response.reasoning_content or ""),
                       content_preview=(content or "")[:200])
-            messages.append({
-                "role": "user",
-                "content": (
+
+            # Tailor the retry prompt to the failure mode
+            if retry_reason.startswith("phantom_work") and rounds == 0:
+                retry_msg = (
+                    "Your response claims you are doing or have started work, but "
+                    "you called zero tools this turn. The text of a response is "
+                    "not the work itself. If you want to delegate to Claude Code, "
+                    "call the ask_claude_code tool. If you want to search the web, "
+                    "call web_search. If you want to run a command, call bash. "
+                    "Do not describe imaginary tool output. Call the actual tools "
+                    "now, then report what they returned."
+                )
+            elif retry_reason.startswith("phantom_work"):
+                retry_msg = (
                     "Your last response reads like narration of upcoming work, but your "
                     "tool calls have already executed — the work above this message has "
                     "already happened. Do NOT start fresh or re-delegate. Instead: look at "
@@ -453,9 +482,26 @@ class Agent:
                     "What is the current state? If you are unsure whether previous work "
                     "exists, verify it first with read_file, list_directory, or recall — "
                     "do not assume it doesn't exist."
-                ),
-            })
-            response = await self.llm.chat(messages)  # no tools — forces text
+                )
+            else:
+                retry_msg = (
+                    "Your last response reads like narration of upcoming work, but your "
+                    "tool calls have already executed — the work above this message has "
+                    "already happened. Do NOT start fresh or re-delegate. Instead: look at "
+                    "the tool results above and report, in past tense, what you actually "
+                    "accomplished. What files now exist? What did each tool call return? "
+                    "What is the current state? If you are unsure whether previous work "
+                    "exists, verify it first with read_file, list_directory, or recall — "
+                    "do not assume it doesn't exist."
+                )
+
+            # For phantom_work at rounds==0, give tools so she can actually call them
+            if retry_reason.startswith("phantom_work") and rounds == 0:
+                messages.append({"role": "user", "content": retry_msg})
+                response = await self.llm.chat(messages, tools=tools if tools else None)
+            else:
+                messages.append({"role": "user", "content": retry_msg})
+                response = await self.llm.chat(messages)  # no tools — forces text
             content = response.content
 
         content = content or "(no response)"
