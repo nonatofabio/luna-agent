@@ -236,6 +236,59 @@ Configure servers in `mcp_servers.json`:
 
 Adding a new tool is editing JSON — no code changes.
 
+#### Optional web research with Parallel
+
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) adds
+free web search and page fetching without an account or API key. Anonymous search
+uses Fast mode and has usage limits. This is an optional remote service: search
+queries and requested URLs are sent to Parallel.
+
+Luna's current MCP client uses the Python SDK 1.x API. In Luna's virtual
+environment, ensure that version is installed:
+
+```bash
+python -m pip install "mcp[cli]>=1,<2"
+```
+
+Install Node.js 22 or newer (including `npx`), then add the `parallel` entry below
+to the `servers` object in `mcp_servers.json` at the repository root. Create the
+file if it does not exist; keep any existing server entries. Luna uses stdio, so
+[`mcp-remote`](https://github.com/geelen/mcp-remote) bridges the HTTP endpoint:
+
+```json
+{
+  "servers": {
+    "parallel": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote@0.15.1",
+        "https://search.parallel.ai/mcp",
+        "--transport",
+        "http-only",
+        "--header",
+        "User-Agent:luna-agent/0.1.0"
+      ],
+      "transport": "stdio"
+    }
+  }
+}
+```
+
+Make sure `npx` is on Luna's `PATH`, including when running under systemd. The
+first start downloads the bridge. Restart Luna with your LLM server running
+(`python -m luna` starts the CLI when `DISCORD_TOKEN` is unset).
+For an HTTP proxy, add `--enable-proxy` to `args` and put the required proxy
+variables in this server entry's `env` object.
+
+Ask Luna to call `list_available_tools` with `query` set to `parallel`. It should
+list `parallel__web_search` and `parallel__web_fetch`. For example: "Use
+`parallel__web_search` to find the official Python 3.13 release notes, then use
+`parallel__web_fetch` to read that page and summarize the highlights with source
+links." Luna can invoke these names through `use_tool`. Remove the `parallel`
+entry and restart to disconnect it; the native `web_search` and `web_fetch` tools
+remain available.
+
 ### Discord Bot (`discord_bot.py`)
 
 Responds to DMs, @mentions, and replies in threads it created. Shows a typing indicator while the agent is processing.
